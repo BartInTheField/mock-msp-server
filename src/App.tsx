@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react"
+import React, { useState, useCallback, useMemo, memo } from "react"
 import { useKeyboard, useRenderer } from "@opentui/react"
 import type { ServerState, LogEntry, OcpiModule } from "./server"
 import { pullModule } from "./server"
@@ -9,6 +9,7 @@ interface AppProps {
   state: ServerState
   logs: LogEntry[]
   onLog: (entry: LogEntry) => void
+  onStateChange: () => void
 }
 
 const MAX_LOGS = 100
@@ -26,33 +27,28 @@ const MODULES: { id: OcpiModule; label: string; pullKey: string }[] = [
   { id: "tokens", label: "Tokens", pullKey: "5" },
 ]
 
-export function App({ url, port, state, logs, onLog }: AppProps) {
+export function App({ url, port, state, logs, onLog, onStateChange }: AppProps) {
   const renderer = useRenderer()
   const [statusMsg, setStatusMsg] = useState("")
   const [view, setView] = useState<View>({ screen: "dashboard" })
   const [selectedIndex, setSelectedIndex] = useState(0)
-  const [, forceUpdate] = useState(0)
-
-  useEffect(() => {
-    const interval = setInterval(() => forceUpdate((n) => n + 1), 500)
-    return () => clearInterval(interval)
-  }, [])
 
   const doPull = useCallback(
     async (module: OcpiModule) => {
       setStatusMsg(`Pulling ${module}...`)
-      const result = await pullModule(state, module, onLog)
+      const result = await pullModule(state, module, onLog, onStateChange)
       setStatusMsg(result)
     },
-    [state, onLog]
+    [state, onLog, onStateChange]
   )
 
-  const getEntries = useCallback(
-    (module: OcpiModule): [string, any][] => {
-      return Object.entries(state[module])
-    },
-    [state]
-  )
+  const activeModule = view.screen !== "dashboard" ? view.module : null
+  const activeStore = activeModule ? state[activeModule] : null
+  const activeStoreSize = activeModule ? state.counts[activeModule] : 0
+
+  const entries = useMemo((): [string, any][] => {
+    return activeStore ? Object.entries(activeStore) : []
+  }, [activeStore, activeStoreSize])
 
   useKeyboard((key) => {
     // Global shortcuts
@@ -113,7 +109,7 @@ export function App({ url, port, state, logs, onLog }: AppProps) {
           setStatusMsg("Pulling all modules...")
           const results: string[] = []
           for (const mod of MODULES) {
-            const r = await pullModule(state, mod.id, onLog)
+            const r = await pullModule(state, mod.id, onLog, onStateChange)
             results.push(r)
           }
           setStatusMsg(results.join(" | "))
@@ -124,7 +120,6 @@ export function App({ url, port, state, logs, onLog }: AppProps) {
 
     // List view shortcuts
     if (view.screen === "list") {
-      const entries = getEntries(view.module)
       if (key.name === "j" || key.name === "down") {
         setSelectedIndex((i) => Math.min(entries.length - 1, i + 1))
         return
@@ -148,19 +143,8 @@ export function App({ url, port, state, logs, onLog }: AppProps) {
     }
   })
 
-  const locCount = Object.keys(state.locations).length
-  const sessCount = Object.keys(state.sessions).length
-  const cdrCount = Object.keys(state.cdrs).length
-  const tariffCount = Object.keys(state.tariffs).length
-  const tokenCount = Object.keys(state.tokens).length
   const registered = !!state.cpoCredentials
-  const counts: Record<OcpiModule, number> = {
-    locations: locCount,
-    sessions: sessCount,
-    cdrs: cdrCount,
-    tariffs: tariffCount,
-    tokens: tokenCount,
-  }
+  const counts = state.counts
 
   return (
     <box flexDirection="column" width="100%" height="100%">
@@ -329,10 +313,10 @@ export function App({ url, port, state, logs, onLog }: AppProps) {
           flexDirection="column"
         >
           {view.screen === "dashboard" ? (
-            <RequestLog logs={logs} />
+            <RequestLog logs={logs} logCount={logs.length} />
           ) : view.screen === "list" ? (
             <ObjectList
-              entries={getEntries(view.module)}
+              entries={entries}
               selectedIndex={selectedIndex}
             />
           ) : (
@@ -344,44 +328,61 @@ export function App({ url, port, state, logs, onLog }: AppProps) {
   )
 }
 
-function RequestLog({ logs }: { logs: LogEntry[] }) {
+const METHOD_COLORS: Record<string, string> = {
+  GET: "#9ece6a",
+  POST: "#7aa2f7",
+  PUT: "#e0af68",
+  PATCH: "#bb9af7",
+  DELETE: "#f7768e",
+  OUT: "#7dcfff",
+}
+
+const RequestLog = memo(function RequestLog({ logs, logCount }: { logs: LogEntry[]; logCount: number }) {
+  const visible = useMemo(() => {
+    const start = Math.max(0, logs.length - MAX_LOGS)
+    const slice = logs.slice(start)
+    slice.reverse()
+    return slice
+  }, [logCount])
+
   return (
-    <scrollbox flexGrow={1} focused>
-      {logs.length === 0 ? (
+    <scrollbox flexGrow={1}>
+      {visible.length === 0 ? (
         <text fg="#565f89">Waiting for requests...</text>
       ) : (
-        [...logs]
-          .reverse()
-          .slice(0, MAX_LOGS)
-          .map((log, i) => {
-            const methodColor =
-              log.method === "GET"
-                ? "#9ece6a"
-                : log.method === "POST"
-                  ? "#7aa2f7"
-                  : log.method === "PUT"
-                    ? "#e0af68"
-                    : log.method === "PATCH"
-                      ? "#bb9af7"
-                      : log.method === "DELETE"
-                        ? "#f7768e"
-                        : log.method === "OUT"
-                          ? "#7dcfff"
-                          : "#c0caf5"
-            return (
-              <box key={`${log.timestamp}-${i}`} flexDirection="row" gap={1}>
-                <text fg="#565f89">{log.timestamp.substring(11, 19)}</text>
-                <text fg={methodColor} width={6}>
-                  {log.method}
-                </text>
-                <text fg="#c0caf5">{log.url}</text>
-              </box>
-            )
-          })
+        visible.map((log, i) => (
+          <box key={`${log.timestamp}-${i}`} flexDirection="row" gap={1}>
+            <text fg="#565f89">{log.timestamp.substring(11, 19)}</text>
+            <text fg={METHOD_COLORS[log.method] ?? "#c0caf5"} width={6}>
+              {log.method}
+            </text>
+            <text fg="#c0caf5">{log.url}</text>
+          </box>
+        ))
       )}
     </scrollbox>
   )
-}
+})
+
+const ObjectListRow = memo(function ObjectListRow({
+  entryKey,
+  label,
+  isSelected,
+}: {
+  entryKey: string
+  label: string
+  isSelected: boolean
+}) {
+  return (
+    <box flexDirection="row" gap={1}>
+      <text fg={isSelected ? "#7dcfff" : "#565f89"}>
+        {isSelected ? ">" : " "}
+      </text>
+      <text fg={isSelected ? "#7dcfff" : "#c0caf5"}>{label}</text>
+      <text fg="#565f89">{entryKey !== label ? `(${entryKey})` : ""}</text>
+    </box>
+  )
+})
 
 function ObjectList({
   entries,
@@ -396,52 +397,49 @@ function ObjectList({
 
   return (
     <scrollbox flexGrow={1}>
-      {entries.map(([key, obj], i) => {
-        const isSelected = i === selectedIndex
-        const label = obj.name ?? obj.uid ?? obj.id ?? key
-        return (
-          <box key={key} flexDirection="row" gap={1}>
-            <text fg={isSelected ? "#7dcfff" : "#565f89"}>
-              {isSelected ? ">" : " "}
-            </text>
-            <text fg={isSelected ? "#7dcfff" : "#c0caf5"}>{label}</text>
-            <text fg="#565f89">{key !== label ? `(${key})` : ""}</text>
-          </box>
-        )
-      })}
+      {entries.map(([key, obj], i) => (
+        <ObjectListRow
+          key={key}
+          entryKey={key}
+          label={obj.name ?? obj.uid ?? obj.id ?? key}
+          isSelected={i === selectedIndex}
+        />
+      ))}
     </scrollbox>
   )
 }
 
-function ObjectDetail({ obj }: { obj: any }) {
+const ObjectDetail = memo(function ObjectDetail({ obj }: { obj: any }) {
   if (!obj) {
     return <text fg="#f7768e">Object not found</text>
   }
 
-  const json = JSON.stringify(obj, null, 2)
-  const lines = json.split("\n")
+  const rendered = useMemo(() => {
+    const json = JSON.stringify(obj, null, 2)
+    return json.split("\n").map((line, i) => {
+      const keyMatch = line.match(/^(\s*)"([^"]+)"(:)\s*(.*)$/)
+      if (keyMatch) {
+        const [, indent, jsonKey, colon, rest] = keyMatch
+        return (
+          <text key={i}>
+            {indent}<span fg="#7aa2f7">"{jsonKey}"</span>{colon} <span fg={getValueColor(rest)}>{rest}</span>
+          </text>
+        )
+      }
+      return (
+        <text key={i} fg="#c0caf5">
+          {line}
+        </text>
+      )
+    })
+  }, [obj])
 
   return (
     <scrollbox flexGrow={1} focused>
-      {lines.map((line, i) => {
-        const keyMatch = line.match(/^(\s*)"([^"]+)"(:)\s*(.*)$/)
-        if (keyMatch) {
-          const [, indent, jsonKey, colon, rest] = keyMatch
-          return (
-            <text key={i}>
-              {indent}<span fg="#7aa2f7">"{jsonKey}"</span>{colon} <span fg={getValueColor(rest)}>{rest}</span>
-            </text>
-          )
-        }
-        return (
-          <text key={i} fg="#c0caf5">
-            {line}
-          </text>
-        )
-      })}
+      {rendered}
     </scrollbox>
   )
-}
+})
 
 function getValueColor(raw: string): string {
   const trimmed = raw.trim().replace(/,$/, "")

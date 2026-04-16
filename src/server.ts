@@ -1,5 +1,13 @@
 import express from "express"
 
+export interface ModuleCounts {
+  locations: number
+  sessions: number
+  cdrs: number
+  tariffs: number
+  tokens: number
+}
+
 export interface ServerState {
   cpoCredentials: any | null
   locations: Record<string, any>
@@ -7,6 +15,7 @@ export interface ServerState {
   cdrs: Record<string, any>
   tariffs: Record<string, any>
   tokens: Record<string, any>
+  counts: ModuleCounts
 }
 
 export interface LogEntry {
@@ -57,6 +66,7 @@ export function createServer(config: ServerConfig) {
         last_updated: "2025-01-01T00:00:00Z",
       },
     },
+    counts: { locations: 0, sessions: 0, cdrs: 0, tariffs: 0, tokens: 2 },
   }
 
   function ocpiResponse(
@@ -188,6 +198,7 @@ export function createServer(config: ServerConfig) {
     (req, res) => {
       const { countryCode, partyId, locationId } = req.params
       const key = `${countryCode}/${partyId}/${locationId}`
+      if (!(key in state.locations)) state.counts.locations++
       state.locations[key] = {
         ...req.body,
         country_code: countryCode,
@@ -204,6 +215,7 @@ export function createServer(config: ServerConfig) {
     (req, res) => {
       const { countryCode, partyId, locationId } = req.params
       const key = `${countryCode}/${partyId}/${locationId}`
+      if (!(key in state.locations)) state.counts.locations++
       state.locations[key] = { ...(state.locations[key] ?? {}), ...req.body }
       onStateChange()
       res.json(ocpiResponse(null))
@@ -216,6 +228,7 @@ export function createServer(config: ServerConfig) {
     (req, res) => {
       const { countryCode, partyId, sessionId } = req.params
       const key = `${countryCode}/${partyId}/${sessionId}`
+      if (!(key in state.sessions)) state.counts.sessions++
       state.sessions[key] = {
         ...req.body,
         country_code: countryCode,
@@ -232,6 +245,7 @@ export function createServer(config: ServerConfig) {
     (req, res) => {
       const { countryCode, partyId, sessionId } = req.params
       const key = `${countryCode}/${partyId}/${sessionId}`
+      if (!(key in state.sessions)) state.counts.sessions++
       state.sessions[key] = { ...(state.sessions[key] ?? {}), ...req.body }
       onStateChange()
       res.json(ocpiResponse(null))
@@ -241,6 +255,7 @@ export function createServer(config: ServerConfig) {
   // ---- CDRs ----
   app.post("/ocpi/receiver/2.1.1/cdrs", (req, res) => {
     const cdr = req.body
+    if (!(cdr.id in state.cdrs)) state.counts.cdrs++
     state.cdrs[cdr.id] = cdr
     onStateChange()
     res.set("Location", `${url}/ocpi/receiver/2.1.1/cdrs/${cdr.id}`)
@@ -261,6 +276,7 @@ export function createServer(config: ServerConfig) {
     (req, res) => {
       const { countryCode, partyId, tariffId } = req.params
       const key = `${countryCode}/${partyId}/${tariffId}`
+      if (!(key in state.tariffs)) state.counts.tariffs++
       state.tariffs[key] = {
         ...req.body,
         country_code: countryCode,
@@ -277,6 +293,7 @@ export function createServer(config: ServerConfig) {
     (req, res) => {
       const { countryCode, partyId, tariffId } = req.params
       const key = `${countryCode}/${partyId}/${tariffId}`
+      if (key in state.tariffs) state.counts.tariffs--
       delete state.tariffs[key]
       onStateChange()
       res.json(ocpiResponse(null))
@@ -349,6 +366,7 @@ function storeItems(state: ServerState, module: OcpiModule, items: any[]) {
     } else {
       key = `${item.country_code}/${item.party_id}/${item.id}`
     }
+    if (!(key in store)) state.counts[module]++
     store[key] = item
   }
 }
@@ -356,7 +374,8 @@ function storeItems(state: ServerState, module: OcpiModule, items: any[]) {
 export async function pullModule(
   state: ServerState,
   module: OcpiModule,
-  onLog: (entry: LogEntry) => void
+  onLog: (entry: LogEntry) => void,
+  onStateChange?: () => void
 ): Promise<string> {
   try {
     const result = await discoverEndpoint(state, module, onLog)
@@ -370,6 +389,7 @@ export async function pullModule(
 
     if (Array.isArray(items)) {
       storeItems(state, module, items)
+      onStateChange?.()
       return `Pulled ${items.length} ${module} from CPO`
     }
     return `No ${module} in response`

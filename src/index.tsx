@@ -27,17 +27,28 @@ const port = parseInt(values.port!, 10)
 const logs: LogEntry[] = []
 let triggerRender: () => void = () => {}
 
+let renderScheduled = false
+function scheduleRender() {
+  if (!renderScheduled) {
+    renderScheduled = true
+    queueMicrotask(() => {
+      renderScheduled = false
+      triggerRender()
+    })
+  }
+}
+
 const onLog = (entry: LogEntry) => {
   logs.push(entry)
   if (logs.length > 200) logs.splice(0, logs.length - 200)
-  triggerRender()
+  scheduleRender()
 }
 
 const { state } = createServer({
   url,
   port,
   onLog,
-  onStateChange: () => triggerRender(),
+  onStateChange: () => scheduleRender(),
 })
 
 const renderer = await createCliRenderer({
@@ -46,7 +57,7 @@ const renderer = await createCliRenderer({
 
 function renderApp() {
   root.render(
-    <App url={url} port={port} state={state} logs={logs} onLog={onLog} />
+    <App url={url} port={port} state={state} logs={logs} onLog={onLog} onStateChange={scheduleRender} />
   )
 }
 
