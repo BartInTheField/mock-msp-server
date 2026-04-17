@@ -22,3 +22,6 @@ out/
 # Coverage / test output
 coverage/
 *.out
+
+# Location to store OCPI spec
+spec/

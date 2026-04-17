@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -22,17 +23,44 @@ const (
 )
 
 type moduleDef struct {
-	id      string
-	label   string
-	pullKey string
+	id    string
+	label string
 }
 
 var modules = []moduleDef{
-	{"locations", "Locations", "1"},
-	{"sessions", "Sessions", "2"},
-	{"cdrs", "CDRs", "3"},
-	{"tariffs", "Tariffs", "4"},
-	{"tokens", "Tokens", "5"},
+	{"locations", "Locations"},
+	{"sessions", "Sessions"},
+	{"cdrs", "CDRs"},
+	{"tariffs", "Tariffs"},
+	{"tokens", "Tokens"},
+}
+
+// pullShortcuts returns the module/key pairs the role can pull. The returned
+// slice preserves the order used by TUI rendering and [1]..[n] keys.
+func pullShortcuts(role string) []struct {
+	Mod moduleDef
+	Key string
+} {
+	ids := []string{"locations", "sessions", "cdrs", "tariffs", "tokens"}
+	if role == RoleCPO {
+		ids = []string{"tokens"}
+	}
+	out := make([]struct {
+		Mod moduleDef
+		Key string
+	}, 0, len(ids))
+	for i, id := range ids {
+		for _, m := range modules {
+			if m.id == id {
+				out = append(out, struct {
+					Mod moduleDef
+					Key string
+				}{m, fmt.Sprintf("%d", i+1)})
+				break
+			}
+		}
+	}
+	return out
 }
 
 // --- Colors (Tokyo Night) ---
@@ -52,6 +80,7 @@ var (
 type logMsg LogEntry
 type stateChangeMsg struct{}
 type pullResultMsg string
+type registerResultMsg string
 
 func waitForLog(ch <-chan LogEntry) tea.Cmd {
 	return func() tea.Msg { return logMsg(<-ch) }
@@ -62,26 +91,28 @@ func waitForStateChange(ch <-chan struct{}) tea.Cmd {
 
 // --- Model ---
 type model struct {
-	srv         *Server
-	url         string
-	port        int
-	logCh       <-chan LogEntry
-	stateCh     <-chan struct{}
-	logs        []LogEntry
-	view        view
-	activeMod   string
-	activeKey   string
-	selectedIdx int
+	srv          *Server
+	url          string
+	port         int
+	peerURL      string
+	logCh        <-chan LogEntry
+	stateCh      <-chan struct{}
+	logs         []LogEntry
+	view         view
+	activeMod    string
+	activeKey    string
+	selectedIdx  int
 	detailScroll int
-	width       int
-	height      int
+	width        int
+	height       int
 }
 
-func newModel(srv *Server, url string, port int, logCh <-chan LogEntry, stateCh <-chan struct{}) model {
+func newModel(srv *Server, url string, port int, peerURL string, logCh <-chan LogEntry, stateCh <-chan struct{}) model {
 	return model{
 		srv:     srv,
 		url:     url,
 		port:    port,
+		peerURL: peerURL,
 		logCh:   logCh,
 		stateCh: stateCh,
 		logs:    make([]LogEntry, 0, maxLogs),
@@ -92,7 +123,20 @@ func newModel(srv *Server, url string, port int, logCh <-chan LogEntry, stateCh 
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(waitForLog(m.logCh), waitForStateChange(m.stateCh))
+	cmds := []tea.Cmd{waitForLog(m.logCh), waitForStateChange(m.stateCh)}
+	if m.peerURL != "" {
+		cmds = append(cmds, registerCmd(m.srv, m.peerURL, 300*time.Millisecond))
+	}
+	return tea.Batch(cmds...)
+}
+
+func registerCmd(srv *Server, peerURL string, delay time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		return registerResultMsg(srv.Register(peerURL))
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -112,6 +156,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStateChange(m.stateCh)
 
 	case pullResultMsg:
+		return m, nil
+
+	case registerResultMsg:
 		return m, nil
 
 	case tea.KeyMsg:
@@ -148,9 +195,9 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch m.view {
 	case viewDashboard:
-		for _, mod := range modules {
-			if key == mod.pullKey {
-				return m, pullCmd(m.srv, mod.id)
+		for _, sc := range pullShortcuts(m.srv.Role) {
+			if key == sc.Key {
+				return m, pullCmd(m.srv, sc.Mod.id)
 			}
 		}
 		switch key {
@@ -171,6 +218,10 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logs = m.logs[:0]
 		case "a":
 			return m, pullAllCmd(m.srv)
+		case "r", "R":
+			if m.peerURL != "" {
+				return m, registerCmd(m.srv, m.peerURL, 0)
+			}
 		}
 
 	case viewList:
@@ -227,9 +278,10 @@ func pullCmd(srv *Server, module string) tea.Cmd {
 
 func pullAllCmd(srv *Server) tea.Cmd {
 	return func() tea.Msg {
-		results := make([]string, 0, len(modules))
-		for _, mod := range modules {
-			results = append(results, srv.PullModule(mod.id))
+		mods := srv.PullableModules()
+		results := make([]string, 0, len(mods))
+		for _, mod := range mods {
+			results = append(results, srv.PullModule(mod))
 		}
 		return pullResultMsg(strings.Join(results, " | "))
 	}
@@ -260,7 +312,11 @@ func (m model) View() string {
 }
 
 func (m model) renderHeader() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(cText).Render("Mock MSP OCPI 2.1.1")
+	label := "Mock MSP OCPI 2.1.1"
+	if m.srv.Role == RoleCPO {
+		label = "Mock CPO OCPI 2.1.1"
+	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(cText).Render(label)
 	crumb := ""
 	switch m.view {
 	case viewList:
@@ -319,11 +375,11 @@ func (m model) renderLeftPanel(w, h int) string {
 
 func (m model) renderStatusBox(w int) string {
 	m.srv.State.mu.RLock()
-	registered := m.srv.State.CPOCredentials != nil
-	var cpoName string
+	registered := m.srv.State.PeerCredentials != nil
+	var peerName string
 	if registered {
-		if bd, ok := m.srv.State.CPOCredentials["business_details"].(map[string]any); ok {
-			cpoName, _ = bd["name"].(string)
+		if bd, ok := m.srv.State.PeerCredentials["business_details"].(map[string]any); ok {
+			peerName, _ = bd["name"].(string)
 		}
 	}
 	counts := m.srv.State.Counts
@@ -332,15 +388,19 @@ func (m model) renderStatusBox(w int) string {
 	regValue := "No"
 	regColor := cRed
 	if registered {
-		regValue = cpoName
+		regValue = peerName
 		if regValue == "" {
 			regValue = "Yes"
 		}
 		regColor = cGreen
 	}
 
+	peerLabel := "CPO Registered:"
+	if m.srv.Role == RoleCPO {
+		peerLabel = "MSP Registered:"
+	}
 	lines := []string{
-		kvRow("CPO Registered:", regValue, regColor, w-4),
+		kvRow(peerLabel, regValue, regColor, w-4),
 	}
 	for _, mod := range modules {
 		n := 0
@@ -396,20 +456,45 @@ func (m model) renderBrowseBox(w int) string {
 			prefix = "> "
 			style = lipgloss.NewStyle().Foreground(cCyan)
 		}
-		b.WriteString(style.Render(fmt.Sprintf("%s%s (%d)", prefix, mod.label, n)))
+		row := style.Render(fmt.Sprintf("%s%s (%d)", prefix, mod.label, n))
+		b.WriteString(row + " " + ownershipTag(m.srv.Role, mod.id))
 		b.WriteString("\n")
 	}
 	b.WriteString(lipgloss.NewStyle().Foreground(cMuted).Render("\nj/k navigate, Enter to open"))
 	return boxed("Browse", b.String(), cCyan, w)
 }
 
+func ownershipTag(role, module string) string {
+	if OwnsModule(role, module) {
+		return lipgloss.NewStyle().Foreground(cGreen).Render("asset")
+	}
+	return lipgloss.NewStyle().Foreground(cOrange2).Render("received")
+}
+
+func ownershipDetailHeader(role, module string) string {
+	partyLabel := "MSP"
+	peerLabel := "CPO"
+	if role == RoleCPO {
+		partyLabel = "CPO"
+		peerLabel = "MSP"
+	}
+	label := lipgloss.NewStyle().Foreground(cMuted).Render("Ownership: ")
+	if OwnsModule(role, module) {
+		return label + lipgloss.NewStyle().Foreground(cGreen).Render("asset of this "+partyLabel)
+	}
+	return label + lipgloss.NewStyle().Foreground(cOrange2).Render("received from "+peerLabel)
+}
+
 func (m model) renderPullBox(w int) string {
 	keyStyle := lipgloss.NewStyle().Foreground(cPurple)
 	var b strings.Builder
-	for _, mod := range modules {
-		b.WriteString(keyStyle.Render("["+mod.pullKey+"]") + " " + mod.label + "\n")
+	for _, sc := range pullShortcuts(m.srv.Role) {
+		b.WriteString(keyStyle.Render("["+sc.Key+"]") + " " + sc.Mod.label + "\n")
 	}
 	b.WriteString(keyStyle.Render("[a]") + " Pull All\n")
+	if m.peerURL != "" {
+		b.WriteString(keyStyle.Render("[R]") + " Register w/ peer\n")
+	}
 	b.WriteString(keyStyle.Render("[c]") + " Clear Logs\n")
 	b.WriteString(keyStyle.Render("[q]") + " Quit")
 	return boxed("Pull", b.String(), cPurple, w)
@@ -533,6 +618,7 @@ func (m model) renderObjectList(w, h int) string {
 	if end > len(entries) {
 		end = len(entries)
 	}
+	tag := ownershipTag(m.srv.Role, m.activeMod)
 	var b strings.Builder
 	for i := start; i < end; i++ {
 		e := entries[i]
@@ -557,7 +643,8 @@ func (m model) renderObjectList(w, h int) string {
 			aux = lipgloss.NewStyle().Foreground(cMuted).Render(" (" + e.key + ")")
 		}
 		row := lipgloss.NewStyle().Foreground(keyColor).Render(prefix) +
-			" " + lipgloss.NewStyle().Foreground(lblColor).Render(label) + aux
+			" " + lipgloss.NewStyle().Foreground(lblColor).Render(label) + aux +
+			" " + tag
 		b.WriteString(row)
 		b.WriteString("\n")
 	}
@@ -577,6 +664,7 @@ func (m model) renderObjectDetail(w, h int) string {
 	if err != nil {
 		return lipgloss.NewStyle().Foreground(cRed).Render(err.Error())
 	}
+	ownershipHeader := ownershipDetailHeader(m.srv.Role, m.activeMod)
 	lines := strings.Split(string(raw), "\n")
 	total := len(lines)
 	start := m.detailScroll
@@ -586,13 +674,15 @@ func (m model) renderObjectDetail(w, h int) string {
 	if start < 0 {
 		start = 0
 	}
-	end := start + h - 1 // reserve 1 line for footer
+	end := start + h - 2 // reserve 1 line for ownership header + 1 for footer
 	if end > total {
 		end = total
 	}
 	keyStyle := lipgloss.NewStyle().Foreground(cBlue)
 	textStyle := lipgloss.NewStyle().Foreground(cText)
 	var b strings.Builder
+	b.WriteString(ownershipHeader)
+	b.WriteString("\n")
 	for _, line := range lines[start:end] {
 		match := jsonKeyRe.FindStringSubmatch(line)
 		if match != nil {
@@ -626,8 +716,9 @@ func (m model) detailLineCount() int {
 
 func (m model) detailPageSize() int {
 	// matches renderObjectDetail's visible JSON-line count:
-	// header box (3) + right-panel border (2) + title (1) + footer (1) + header-bottom-gap (2) = 9
-	h := m.height - 9
+	// header box (3) + right-panel border (2) + title (1) + ownership (1)
+	// + footer (1) + header-bottom-gap (2) = 10
+	h := m.height - 10
 	if h < 3 {
 		return 3
 	}
