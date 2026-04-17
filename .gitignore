@@ -1,12 +1,7 @@
-# Dependencies
-node_modules/
-
 # Build output
+/mock-msp
 dist/
 out/
-
-# Bun
-bun.lockb
 
 # Environment
 .env
@@ -26,3 +21,4 @@ bun.lockb
 
 # Coverage / test output
 coverage/
+*.out
