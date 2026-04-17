@@ -312,9 +312,9 @@ func (m model) View() string {
 }
 
 func (m model) renderHeader() string {
-	label := "Mock MSP OCPI 2.1.1"
+	label := "Mock MSP OCPI 2.1.1 / 2.2.1"
 	if m.srv.Role == RoleCPO {
-		label = "Mock CPO OCPI 2.1.1"
+		label = "Mock CPO OCPI 2.1.1 / 2.2.1"
 	}
 	title := lipgloss.NewStyle().Bold(true).Foreground(cText).Render(label)
 	crumb := ""
@@ -376,19 +376,18 @@ func (m model) renderLeftPanel(w, h int) string {
 func (m model) renderStatusBox(w int) string {
 	m.srv.State.mu.RLock()
 	registered := m.srv.State.PeerCredentials != nil
-	var peerName string
+	var peerBizName string
 	if registered {
-		if bd, ok := m.srv.State.PeerCredentials["business_details"].(map[string]any); ok {
-			peerName, _ = bd["name"].(string)
-		}
+		peerBizName = peerName(m.srv.State.PeerCredentials)
 	}
+	peerVersion := m.srv.State.PeerVersion
 	counts := m.srv.State.Counts
 	m.srv.State.mu.RUnlock()
 
 	regValue := "No"
 	regColor := cRed
 	if registered {
-		regValue = peerName
+		regValue = peerBizName
 		if regValue == "" {
 			regValue = "Yes"
 		}
@@ -399,8 +398,15 @@ func (m model) renderStatusBox(w int) string {
 	if m.srv.Role == RoleCPO {
 		peerLabel = "MSP Registered:"
 	}
+	protoValue := "—"
+	protoColor := cMuted
+	if peerVersion != "" {
+		protoValue = peerVersion
+		protoColor = cCyan
+	}
 	lines := []string{
 		kvRow(peerLabel, regValue, regColor, w-4),
+		kvRow("Protocol:", protoValue, protoColor, w-4),
 	}
 	for _, mod := range modules {
 		n := 0

@@ -18,10 +18,77 @@ var moduleEndpointIDs = map[string]string{
 	"tokens":    "tokens",
 }
 
+func randomRequestID() string {
+	return fmt.Sprintf("req-%d", time.Now().UnixNano())
+}
+
+// peerIdentity extracts (country_code, party_id) from a credentials object,
+// handling both the flat 2.1.1 shape and the nested 2.2.1 shape (roles[0]).
+func peerIdentity(creds map[string]any) (string, string, bool) {
+	if cc, _ := creds["country_code"].(string); cc != "" {
+		if pid, _ := creds["party_id"].(string); pid != "" {
+			return cc, pid, true
+		}
+	}
+	if roles, ok := creds["roles"].([]any); ok && len(roles) > 0 {
+		if r, ok := roles[0].(map[string]any); ok {
+			cc, _ := r["country_code"].(string)
+			pid, _ := r["party_id"].(string)
+			if cc != "" && pid != "" {
+				return cc, pid, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// peerName extracts business_details.name from credentials for either version.
+func peerName(creds map[string]any) string {
+	if bd, ok := creds["business_details"].(map[string]any); ok {
+		if n, _ := bd["name"].(string); n != "" {
+			return n
+		}
+	}
+	if roles, ok := creds["roles"].([]any); ok && len(roles) > 0 {
+		if r, ok := roles[0].(map[string]any); ok {
+			if bd, ok := r["business_details"].(map[string]any); ok {
+				if n, _ := bd["name"].(string); n != "" {
+					return n
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// setAuthHeaders sets the Authorization header and the 2.2.1 routing headers.
+// The extra headers are harmless for 2.1.1 peers (they ignore unknown headers)
+// and mandatory for 2.2.1, so we always send them.
+func (s *Server) setAuthHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Token "+token)
+	req.Header.Set("X-Request-ID", randomRequestID())
+	req.Header.Set("X-Correlation-ID", randomRequestID())
+	req.Header.Set("OCPI-from-country-code", s.CountryCode)
+	req.Header.Set("OCPI-from-party-id", s.PartyID)
+	s.State.mu.RLock()
+	peer := s.State.PeerCredentials
+	s.State.mu.RUnlock()
+	if peer != nil {
+		if cc, pid, ok := peerIdentity(peer); ok {
+			req.Header.Set("OCPI-to-country-code", cc)
+			req.Header.Set("OCPI-to-party-id", pid)
+		}
+	}
+}
+
 func (s *Server) discoverEndpoint(module string) (string, string, error) {
 	s.State.mu.RLock()
 	creds := s.State.PeerCredentials
+	version := s.State.PeerVersion
 	s.State.mu.RUnlock()
+	if version == "" {
+		version = VersionV211
+	}
 
 	peerLabel := "CPO"
 	if s.Role == RoleCPO {
@@ -41,22 +108,22 @@ func (s *Server) discoverEndpoint(module string) (string, string, error) {
 		return "", "", err
 	}
 	versions, _ := versionsBody["data"].([]any)
-	var v2URL string
+	var vURL string
 	for _, v := range versions {
 		m, ok := v.(map[string]any)
 		if !ok {
 			continue
 		}
-		if m["version"] == "2.1.1" {
-			v2URL, _ = m["url"].(string)
+		if m["version"] == version {
+			vURL, _ = m["url"].(string)
 			break
 		}
 	}
-	if v2URL == "" {
-		return "", "", fmt.Errorf("%s does not support OCPI 2.1.1", peerLabel)
+	if vURL == "" {
+		return "", "", fmt.Errorf("%s does not support OCPI %s", peerLabel, version)
 	}
 
-	detailsBody, err := s.authedGetJSON(v2URL, token)
+	detailsBody, err := s.authedGetJSON(vURL, token)
 	if err != nil {
 		return "", "", err
 	}
@@ -68,10 +135,18 @@ func (s *Server) discoverEndpoint(module string) (string, string, error) {
 		if !ok {
 			continue
 		}
-		if m["identifier"] == want {
-			u, _ := m["url"].(string)
-			return u, token, nil
+		if m["identifier"] != want {
+			continue
 		}
+		// In 2.2.1 each module may appear as SENDER and RECEIVER — we always
+		// pull from the peer's SENDER side.
+		if version == VersionV221 {
+			if role, _ := m["role"].(string); role != "SENDER" {
+				continue
+			}
+		}
+		u, _ := m["url"].(string)
+		return u, token, nil
 	}
 	return "", "", fmt.Errorf("%s has no %s endpoint", peerLabel, module)
 }
@@ -94,10 +169,12 @@ func (s *Server) canPull(module string) bool {
 }
 
 // Register performs the OCPI credentials handshake against the given peer base
-// URL. It discovers the peer's versions + credentials endpoint, PUTs our own
-// identity, and stores the real peer credentials returned. The peer URL can be
-// the versions URL directly (containing "/ocpi/") or just a base (e.g.
-// "http://localhost:3011"), in which case "/ocpi/versions" is appended.
+// URL. It discovers the peer's versions, negotiates the highest mutually
+// supported OCPI version (preferring 2.2.1 over 2.1.1), PUTs our own identity
+// in the corresponding shape, and stores the real peer credentials returned.
+// The peer URL can be the versions URL directly (containing "/ocpi/") or just
+// a base (e.g. "http://localhost:3011"), in which case "/ocpi/versions" is
+// appended.
 func (s *Server) Register(peerURL string) string {
 	if peerURL == "" {
 		return "Failed: no peer URL"
@@ -120,22 +197,31 @@ func (s *Server) Register(peerURL string) string {
 		return "Register failed: " + err.Error()
 	}
 	versions, _ := body["data"].([]any)
-	var v2URL string
+	peerVersions := map[string]string{}
 	for _, v := range versions {
 		m, ok := v.(map[string]any)
 		if !ok {
 			continue
 		}
-		if m["version"] == "2.1.1" {
-			v2URL, _ = m["url"].(string)
+		ver, _ := m["version"].(string)
+		url, _ := m["url"].(string)
+		if ver != "" && url != "" {
+			peerVersions[ver] = url
+		}
+	}
+
+	var chosen, vURL string
+	for _, v := range SupportedVersions {
+		if u, ok := peerVersions[v]; ok {
+			chosen, vURL = v, u
 			break
 		}
 	}
-	if v2URL == "" {
-		return fmt.Sprintf("Register failed: %s does not support OCPI 2.1.1", peerLabel)
+	if chosen == "" {
+		return fmt.Sprintf("Register failed: %s supports no compatible OCPI version", peerLabel)
 	}
 
-	details, err := s.authedGetJSON(v2URL, initialToken)
+	details, err := s.authedGetJSON(vURL, initialToken)
 	if err != nil {
 		return "Register failed: " + err.Error()
 	}
@@ -156,7 +242,7 @@ func (s *Server) Register(peerURL string) string {
 		return fmt.Sprintf("Register failed: %s has no credentials endpoint", peerLabel)
 	}
 
-	payload, err := json.Marshal(s.identity())
+	payload, err := json.Marshal(s.identity(chosen))
 	if err != nil {
 		return "Register failed: " + err.Error()
 	}
@@ -165,7 +251,7 @@ func (s *Server) Register(peerURL string) string {
 	if err != nil {
 		return "Register failed: " + err.Error()
 	}
-	req.Header.Set("Authorization", "Token "+initialToken)
+	s.setAuthHeaders(req, initialToken)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 15 * time.Second}
 	res, err := client.Do(req)
@@ -191,17 +277,15 @@ func (s *Server) Register(peerURL string) string {
 
 	s.State.mu.Lock()
 	s.State.PeerCredentials = peerCreds
+	s.State.PeerVersion = chosen
 	s.State.mu.Unlock()
 	s.OnStateChange()
 
-	name := ""
-	if bd, ok := peerCreds["business_details"].(map[string]any); ok {
-		name, _ = bd["name"].(string)
-	}
+	name := peerName(peerCreds)
 	if name == "" {
 		name = peerLabel
 	}
-	return "Registered with " + name
+	return fmt.Sprintf("Registered with %s (OCPI %s)", name, chosen)
 }
 
 func (s *Server) authedGetJSON(url, token string) (map[string]any, error) {
@@ -210,7 +294,7 @@ func (s *Server) authedGetJSON(url, token string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Token "+token)
+	s.setAuthHeaders(req, token)
 	client := &http.Client{Timeout: 15 * time.Second}
 	res, err := client.Do(req)
 	if err != nil {

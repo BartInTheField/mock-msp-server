@@ -28,6 +28,7 @@ type ModuleCounts struct {
 type ServerState struct {
 	mu              sync.RWMutex
 	PeerCredentials map[string]any
+	PeerVersion     string
 	Locations       map[string]map[string]any
 	Sessions        map[string]map[string]any
 	CDRs            map[string]map[string]any
@@ -90,6 +91,23 @@ const (
 	RoleMSP = "msp"
 	RoleCPO = "cpo"
 )
+
+const (
+	VersionV211 = "2.1.1"
+	VersionV221 = "2.2.1"
+)
+
+// SupportedVersions is the order in which versions are advertised; first is
+// preferred during client-side negotiation.
+var SupportedVersions = []string{VersionV221, VersionV211}
+
+// ocpiRole maps our internal role to the OCPI 2.2.1 role string.
+func ocpiRole(role string) string {
+	if role == RoleCPO {
+		return "CPO"
+	}
+	return "EMSP"
+}
 
 // OwnsModule reports whether this role is the OCPI sender for the given
 // module — i.e. items in that module belong to this party (asset). The
@@ -300,12 +318,26 @@ func decodeBody(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
-func (s *Server) identity() map[string]any {
+func (s *Server) identity(version string) map[string]any {
 	token := "mocked-msp-token"
 	name := "Mock MSP"
 	if s.Role == RoleCPO {
 		token = "mocked-cpo-token"
 		name = "Mock CPO"
+	}
+	if version == VersionV221 {
+		return map[string]any{
+			"token": token,
+			"url":   s.URL + "/ocpi/versions",
+			"roles": []map[string]any{
+				{
+					"role":             ocpiRole(s.Role),
+					"business_details": map[string]any{"name": name},
+					"party_id":         s.PartyID,
+					"country_code":     s.CountryCode,
+				},
+			},
+		}
 	}
 	return map[string]any{
 		"token":            token,
@@ -316,72 +348,50 @@ func (s *Server) identity() map[string]any {
 	}
 }
 
-func (s *Server) endpointsList() []map[string]any {
+func (s *Server) endpointsList(version string) []map[string]any {
+	tag := func(identifier, role, url string) map[string]any {
+		e := map[string]any{"identifier": identifier, "url": url}
+		if version == VersionV221 {
+			e["role"] = role
+		}
+		return e
+	}
+	base := s.URL + "/ocpi"
 	if s.Role == RoleCPO {
 		return []map[string]any{
-			{"identifier": "credentials", "url": s.URL + "/ocpi/2.1.1/credentials"},
-			{"identifier": "locations", "url": s.URL + "/ocpi/sender/2.1.1/locations"},
-			{"identifier": "sessions", "url": s.URL + "/ocpi/sender/2.1.1/sessions"},
-			{"identifier": "cdrs", "url": s.URL + "/ocpi/sender/2.1.1/cdrs"},
-			{"identifier": "tariffs", "url": s.URL + "/ocpi/sender/2.1.1/tariffs"},
-			{"identifier": "tokens", "url": s.URL + "/ocpi/receiver/2.1.1/tokens"},
-			{"identifier": "commands", "url": s.URL + "/ocpi/receiver/2.1.1/commands"},
+			tag("credentials", "SENDER", base+"/"+version+"/credentials"),
+			tag("locations", "SENDER", base+"/sender/"+version+"/locations"),
+			tag("sessions", "SENDER", base+"/sender/"+version+"/sessions"),
+			tag("cdrs", "SENDER", base+"/sender/"+version+"/cdrs"),
+			tag("tariffs", "SENDER", base+"/sender/"+version+"/tariffs"),
+			tag("tokens", "RECEIVER", base+"/receiver/"+version+"/tokens"),
+			tag("commands", "RECEIVER", base+"/receiver/"+version+"/commands"),
 		}
 	}
 	return []map[string]any{
-		{"identifier": "credentials", "url": s.URL + "/ocpi/2.1.1/credentials"},
-		{"identifier": "locations", "url": s.URL + "/ocpi/receiver/2.1.1/locations"},
-		{"identifier": "sessions", "url": s.URL + "/ocpi/receiver/2.1.1/sessions"},
-		{"identifier": "cdrs", "url": s.URL + "/ocpi/receiver/2.1.1/cdrs"},
-		{"identifier": "tariffs", "url": s.URL + "/ocpi/receiver/2.1.1/tariffs"},
-		{"identifier": "tokens", "url": s.URL + "/ocpi/sender/2.1.1/tokens"},
-		{"identifier": "commands", "url": s.URL + "/ocpi/receiver/2.1.1/commands"},
+		tag("credentials", "SENDER", base+"/"+version+"/credentials"),
+		tag("locations", "RECEIVER", base+"/receiver/"+version+"/locations"),
+		tag("sessions", "RECEIVER", base+"/receiver/"+version+"/sessions"),
+		tag("cdrs", "RECEIVER", base+"/receiver/"+version+"/cdrs"),
+		tag("tariffs", "RECEIVER", base+"/receiver/"+version+"/tariffs"),
+		tag("tokens", "SENDER", base+"/sender/"+version+"/tokens"),
+		tag("commands", "RECEIVER", base+"/receiver/"+version+"/commands"),
 	}
 }
 
 func (s *Server) routes() {
 	mux := http.NewServeMux()
 
-	// Versions
 	mux.HandleFunc("GET /ocpi/versions", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, okResponse([]map[string]any{
-			{"version": "2.1.1", "url": s.URL + "/ocpi/2.1.1"},
-		}))
-	})
-
-	mux.HandleFunc("GET /ocpi/2.1.1", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, okResponse(map[string]any{
-			"version":   "2.1.1",
-			"endpoints": s.endpointsList(),
-		}))
-	})
-
-	// Credentials
-	mux.HandleFunc("GET /ocpi/2.1.1/credentials", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, okResponse(s.identity()))
-	})
-
-	mux.HandleFunc("PUT /ocpi/2.1.1/credentials", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		if err := decodeBody(r, &body); err != nil || body["token"] == nil {
-			writeJSON(w, 400, ocpiResponse(nil, 2001, "Token is required"))
-			return
+		entries := make([]map[string]any, 0, len(SupportedVersions))
+		for _, v := range SupportedVersions {
+			entries = append(entries, map[string]any{"version": v, "url": s.URL + "/ocpi/" + v})
 		}
-		s.State.mu.Lock()
-		s.State.PeerCredentials = body
-		s.State.mu.Unlock()
-		s.OnStateChange()
-		writeJSON(w, 200, okResponse(s.identity()))
+		writeJSON(w, 200, okResponse(entries))
 	})
 
-	mux.HandleFunc("DELETE /ocpi/2.1.1/credentials", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, okResponse(nil))
-	})
-
-	if s.Role == RoleCPO {
-		s.registerCPORoutes(mux)
-	} else {
-		s.registerMSPRoutes(mux)
+	for _, v := range SupportedVersions {
+		s.registerVersionRoutes(mux, v)
 	}
 
 	// Catch-all
@@ -390,6 +400,48 @@ func (s *Server) routes() {
 	})
 
 	s.mux = mux
+}
+
+func (s *Server) registerVersionRoutes(mux *http.ServeMux, v string) {
+	mux.HandleFunc("GET /ocpi/"+v, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, okResponse(map[string]any{
+			"version":   v,
+			"endpoints": s.endpointsList(v),
+		}))
+	})
+
+	mux.HandleFunc("GET /ocpi/"+v+"/credentials", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, okResponse(s.identity(v)))
+	})
+
+	mux.HandleFunc("PUT /ocpi/"+v+"/credentials", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := decodeBody(r, &body); err != nil || body["token"] == nil {
+			writeJSON(w, 400, ocpiResponse(nil, 2001, "Token is required"))
+			return
+		}
+		s.State.mu.Lock()
+		s.State.PeerCredentials = body
+		s.State.PeerVersion = v
+		s.State.mu.Unlock()
+		s.OnStateChange()
+		writeJSON(w, 200, okResponse(s.identity(v)))
+	})
+
+	mux.HandleFunc("DELETE /ocpi/"+v+"/credentials", func(w http.ResponseWriter, r *http.Request) {
+		s.State.mu.Lock()
+		s.State.PeerCredentials = nil
+		s.State.PeerVersion = ""
+		s.State.mu.Unlock()
+		s.OnStateChange()
+		writeJSON(w, 200, okResponse(nil))
+	})
+
+	if s.Role == RoleCPO {
+		s.registerCPORoutes(mux, v)
+	} else {
+		s.registerMSPRoutes(mux, v)
+	}
 }
 
 // putOrPatchModule returns a handler that stores/updates an item keyed by
@@ -434,9 +486,12 @@ func (s *Server) putOrPatchModule(module, idParam string, merge bool) http.Handl
 	}
 }
 
-func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
+func (s *Server) registerMSPRoutes(mux *http.ServeMux, v string) {
+	sender := "/ocpi/sender/" + v
+	receiver := "/ocpi/receiver/" + v
+
 	// Tokens (sender)
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/tokens", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+sender+"/tokens", func(w http.ResponseWriter, r *http.Request) {
 		s.State.mu.RLock()
 		list := make([]map[string]any, 0, len(s.State.Tokens))
 		for _, t := range s.State.Tokens {
@@ -446,7 +501,7 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, okResponse(list))
 	})
 
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/tokens/{countryCode}/{partyId}/{tokenUid}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+sender+"/tokens/{countryCode}/{partyId}/{tokenUid}", func(w http.ResponseWriter, r *http.Request) {
 		uid := r.PathValue("tokenUid")
 		s.State.mu.RLock()
 		token, ok := s.State.Tokens[uid]
@@ -458,7 +513,7 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
 		writeJSON(w, 200, okResponse(token))
 	})
 
-	mux.HandleFunc("POST /ocpi/sender/2.1.1/tokens/{tokenUid}/authorize", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+sender+"/tokens/{tokenUid}/authorize", func(w http.ResponseWriter, r *http.Request) {
 		uid := r.PathValue("tokenUid")
 		s.State.mu.RLock()
 		token, ok := s.State.Tokens[uid]
@@ -476,15 +531,15 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
 	})
 
 	// Locations / Sessions / Tariffs receivers
-	mux.HandleFunc("PUT /ocpi/receiver/2.1.1/locations/{countryCode}/{partyId}/{id}", s.putOrPatchModule("locations", "id", false))
-	mux.HandleFunc("PATCH /ocpi/receiver/2.1.1/locations/{countryCode}/{partyId}/{id}", s.putOrPatchModule("locations", "id", true))
+	mux.HandleFunc("PUT "+receiver+"/locations/{countryCode}/{partyId}/{id}", s.putOrPatchModule("locations", "id", false))
+	mux.HandleFunc("PATCH "+receiver+"/locations/{countryCode}/{partyId}/{id}", s.putOrPatchModule("locations", "id", true))
 
-	mux.HandleFunc("PUT /ocpi/receiver/2.1.1/sessions/{countryCode}/{partyId}/{id}", s.putOrPatchModule("sessions", "id", false))
-	mux.HandleFunc("PATCH /ocpi/receiver/2.1.1/sessions/{countryCode}/{partyId}/{id}", s.putOrPatchModule("sessions", "id", true))
+	mux.HandleFunc("PUT "+receiver+"/sessions/{countryCode}/{partyId}/{id}", s.putOrPatchModule("sessions", "id", false))
+	mux.HandleFunc("PATCH "+receiver+"/sessions/{countryCode}/{partyId}/{id}", s.putOrPatchModule("sessions", "id", true))
 
-	mux.HandleFunc("PUT /ocpi/receiver/2.1.1/tariffs/{countryCode}/{partyId}/{id}", s.putOrPatchModule("tariffs", "id", false))
+	mux.HandleFunc("PUT "+receiver+"/tariffs/{countryCode}/{partyId}/{id}", s.putOrPatchModule("tariffs", "id", false))
 
-	mux.HandleFunc("DELETE /ocpi/receiver/2.1.1/tariffs/{countryCode}/{partyId}/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE "+receiver+"/tariffs/{countryCode}/{partyId}/{id}", func(w http.ResponseWriter, r *http.Request) {
 		cc := r.PathValue("countryCode")
 		pid := r.PathValue("partyId")
 		id := r.PathValue("id")
@@ -500,7 +555,8 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
 	})
 
 	// CDRs
-	mux.HandleFunc("POST /ocpi/receiver/2.1.1/cdrs", func(w http.ResponseWriter, r *http.Request) {
+	cdrLocation := s.URL + receiver + "/cdrs"
+	mux.HandleFunc("POST "+receiver+"/cdrs", func(w http.ResponseWriter, r *http.Request) {
 		var cdr map[string]any
 		if err := decodeBody(r, &cdr); err != nil {
 			cdr = map[string]any{}
@@ -517,11 +573,11 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
 		s.State.CDRs[id] = cdr
 		s.State.mu.Unlock()
 		s.OnStateChange()
-		w.Header().Set("Location", fmt.Sprintf("%s/ocpi/receiver/2.1.1/cdrs/%s", s.URL, id))
+		w.Header().Set("Location", cdrLocation+"/"+id)
 		writeJSON(w, 201, okResponse(nil))
 	})
 
-	mux.HandleFunc("GET /ocpi/receiver/2.1.1/cdrs/{cdrId}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+receiver+"/cdrs/{cdrId}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("cdrId")
 		s.State.mu.RLock()
 		cdr, ok := s.State.CDRs[id]
@@ -534,12 +590,15 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux) {
 	})
 
 	// Commands (async result callback from CPO)
-	mux.HandleFunc("POST /ocpi/receiver/2.1.1/commands/{command}/{uid}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+receiver+"/commands/{command}/{uid}", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, okResponse(nil))
 	})
 }
 
-func (s *Server) registerCPORoutes(mux *http.ServeMux) {
+func (s *Server) registerCPORoutes(mux *http.ServeMux, v string) {
+	sender := "/ocpi/sender/" + v
+	receiver := "/ocpi/receiver/" + v
+
 	// Sender: locations / sessions / cdrs / tariffs (MSP pulls these)
 	listSender := func(module string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -570,19 +629,19 @@ func (s *Server) registerCPORoutes(mux *http.ServeMux) {
 		}
 	}
 
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/locations", listSender("locations"))
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/locations/{countryCode}/{partyId}/{id}", getSenderByKey("locations"))
+	mux.HandleFunc("GET "+sender+"/locations", listSender("locations"))
+	mux.HandleFunc("GET "+sender+"/locations/{countryCode}/{partyId}/{id}", getSenderByKey("locations"))
 
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/sessions", listSender("sessions"))
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/cdrs", listSender("cdrs"))
-	mux.HandleFunc("GET /ocpi/sender/2.1.1/tariffs", listSender("tariffs"))
+	mux.HandleFunc("GET "+sender+"/sessions", listSender("sessions"))
+	mux.HandleFunc("GET "+sender+"/cdrs", listSender("cdrs"))
+	mux.HandleFunc("GET "+sender+"/tariffs", listSender("tariffs"))
 
 	// Receiver: tokens (MSP pushes these)
-	mux.HandleFunc("PUT /ocpi/receiver/2.1.1/tokens/{countryCode}/{partyId}/{tokenUid}", s.putOrPatchModule("tokens", "tokenUid", false))
-	mux.HandleFunc("PATCH /ocpi/receiver/2.1.1/tokens/{countryCode}/{partyId}/{tokenUid}", s.putOrPatchModule("tokens", "tokenUid", true))
+	mux.HandleFunc("PUT "+receiver+"/tokens/{countryCode}/{partyId}/{tokenUid}", s.putOrPatchModule("tokens", "tokenUid", false))
+	mux.HandleFunc("PATCH "+receiver+"/tokens/{countryCode}/{partyId}/{tokenUid}", s.putOrPatchModule("tokens", "tokenUid", true))
 
 	// Receiver: commands (MSP sends commands to CPO)
-	mux.HandleFunc("POST /ocpi/receiver/2.1.1/commands/{command}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+receiver+"/commands/{command}", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, okResponse(map[string]any{"result": "ACCEPTED"}))
 	})
 }
