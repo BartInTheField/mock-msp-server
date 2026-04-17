@@ -1,17 +1,17 @@
-# Mock MSP — OCPI 2.1.1 Mock Mobility Service Provider
+# Mock OCPI — 2.1.1 Mock MSP & CPO
 
-A mock Mobility Service Provider (MSP) server implementing the [OCPI 2.1.1](https://github.com/ocpi/ocpi/tree/release-2.1.1-bugfixes) protocol. Useful for testing and developing Charge Point Operator (CPO) integrations without needing a real MSP backend.
+A mock server that can play either side of the [OCPI 2.1.1](https://github.com/ocpi/ocpi/tree/release-2.1.1-bugfixes) protocol: a **Mobility Service Provider (MSP)** or a **Charge Point Operator (CPO)**. Useful for testing and developing integrations without needing a real counterparty.
 
-The server provides an interactive terminal UI (TUI) for real-time monitoring of requests, browsing stored data, and pulling modules from connected CPOs.
+The server provides an interactive terminal UI (TUI) for real-time monitoring of requests, browsing stored data, and pulling modules from the connected peer.
 
 ## Features
 
 - Full OCPI 2.1.1 credential handshake (registration flow)
-- Sender interface for **Tokens**
-- Receiver interfaces for **Locations**, **Sessions**, **CDRs**, **Tariffs**, and **Commands**
-- Pull data from connected CPO endpoints via OCPI discovery
+- **MSP mode** — sender interface for Tokens; receiver interfaces for Locations, Sessions, CDRs, Tariffs, Commands
+- **CPO mode** — sender interfaces for Locations, Sessions, CDRs, Tariffs; receiver interfaces for Tokens and Commands
+- Pull data from the peer via OCPI version discovery
 - Interactive TUI dashboard with live request logging and data browsing
-- In-memory data storage with pre-configured RFID tokens
+- In-memory data storage with pre-configured mock data per role
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ The server provides an interactive terminal UI (TUI) for real-time monitoring of
 # Fetch dependencies
 go mod tidy
 
-# Run
+# Run in MSP mode (default)
 go run .
 
 # Or build a binary
@@ -34,48 +34,95 @@ go build -o mock-msp . && ./mock-msp
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `--role`, `-r` | OCPI role to mock: `msp` or `cpo` | `msp` |
 | `--port`, `-p` | Server port | `3010` |
 | `--url`, `-u` | Public URL for OCPI endpoints | `http://localhost:3010` |
+| `--peer`, `-P` | Peer base URL to auto-register with on startup (e.g. `http://localhost:3011`). In the TUI, press `R` to re-register. | _unset_ |
+| `--party-id` | OCPI `party_id` | `MSP` for `--role msp`, `CPO` for `--role cpo` |
+| `--country-code` | OCPI `country_code` (ISO-3166 alpha-2) | `NL` |
 
-Example:
+Examples:
 
 ```bash
+# Mock an MSP on port 8080
 go run . --port 8080 --url https://my-msp.example.com
+
+# Mock a CPO on port 3011
+go run . --role cpo --port 3011 --url http://localhost:3011
+
+# Mock an MSP that auto-registers with a CPO running on :3011
+go run . --role msp --peer http://localhost:3011
 ```
+
+### End-to-end test with two instances
+
+Run a CPO in one terminal and an MSP in another — the MSP does the credentials
+handshake automatically via `--peer`:
+
+```bash
+# Terminal 1
+./mock-msp --role cpo --port 3011 --url http://localhost:3011
+
+# Terminal 2
+./mock-msp --role msp --port 3010 --url http://localhost:3010 --peer http://localhost:3011
+```
+
+After a moment both TUIs will show each other under `Registered`. Press `[1]`
+in the MSP TUI to pull Locations from the CPO, `[1]` in the CPO TUI to pull
+Tokens from the MSP, or `[R]` on either side to redo the handshake.
 
 ## Using with ngrok
 
-To expose your local Mock MSP to external CPO servers (e.g. for testing against a staging environment), use [ngrok](https://ngrok.com):
+To expose the server to external systems, use [ngrok](https://ngrok.com):
 
 ```bash
 # 1. Start an ngrok tunnel on the same port as the server
 ngrok http 3010
 
-# 2. Copy the forwarding URL from ngrok (e.g. https://ab12-34-56-78.ngrok-free.app)
-
-# 3. Start the server with the ngrok URL so OCPI endpoints advertise the correct public address
+# 2. Start the server with the ngrok URL so OCPI endpoints advertise the correct public address
 go run . --url https://ab12-34-56-78.ngrok-free.app
 ```
 
-The `--url` flag ensures that the versions and credentials endpoints return the ngrok URL instead of `localhost`, so the CPO can reach your server over the internet.
+The `--url` flag ensures that the versions and credentials endpoints return the ngrok URL instead of `localhost`, so the peer can reach the server over the internet.
 
 ## How It Works
 
 1. Start the server — it listens for incoming OCPI requests and displays the TUI dashboard.
-2. A CPO registers by sending `PUT /ocpi/cpo/2.1.1/credentials` with its credentials.
+2. The peer registers by sending `PUT /ocpi/2.1.1/credentials` with its credentials.
 3. The server responds with its own credentials, completing the OCPI handshake.
-4. Once connected, use the TUI to pull locations, sessions, tariffs, and CDRs from the CPO.
-5. The CPO can also push data to the server's receiver endpoints.
+4. Once connected, use the TUI to pull modules from the peer:
+   - **MSP mode:** pull locations, sessions, CDRs, tariffs, and tokens from the CPO.
+   - **CPO mode:** pull tokens from the MSP.
+5. The peer can also push data to the server's receiver endpoints.
 
-### Default MSP Identity
+### MSP Mode
+
+Default identity (override with `--party-id` / `--country-code`):
 
 | Field | Value |
 |-------|-------|
-| Party ID | `MFC` |
+| Party ID | `MSP` |
 | Country Code | `NL` |
 | Token | `mocked-msp-token` |
 
 Two pre-configured RFID tokens (`valid-token-1`, `valid-token-2`) are available for authorization testing.
+
+### CPO Mode
+
+Default identity (override with `--party-id` / `--country-code`):
+
+| Field | Value |
+|-------|-------|
+| Party ID | `CPO` |
+| Country Code | `NL` |
+| Token | `mocked-cpo-token` |
+
+Pre-populated data (visible via MSP-side pulls):
+
+- One mock location (`NL/CPO/LOC001`) with an AVAILABLE EVSE and connector.
+- One mock tariff (`NL/CPO/TARIFF001`, €0.25/kWh).
+
+MSPs can push tokens via `PUT /ocpi/receiver/2.1.1/tokens/{countryCode}/{partyId}/{tokenUid}` and send commands via `POST /ocpi/receiver/2.1.1/commands/{command}`.
 
 ## TUI Navigation
 
@@ -83,14 +130,18 @@ Two pre-configured RFID tokens (`valid-token-1`, `valid-token-2`) are available 
 |-----|--------|
 | `j` / `k` | Navigate up/down |
 | `Enter` | Select item |
+| `p` | Pull current module |
+| `a` | Pull all modules |
+| `c` | Clear logs |
+| `Esc` | Go back |
 | `q` | Quit |
 
 ## Project Structure
 
 ```
 main.go      # Entry point — CLI flag parsing, server + TUI wiring
-server.go    # net/http server with OCPI endpoint handlers
-pull.go      # CPO endpoint discovery and pull-module logic
+server.go    # net/http server with role-based OCPI endpoint handlers
+pull.go      # Peer endpoint discovery and pull-module logic
 tui.go       # Bubble Tea TUI dashboard
 ```
 
