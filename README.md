@@ -15,19 +15,19 @@ The server provides an interactive terminal UI (TUI) for real-time monitoring of
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) runtime
+- [Go](https://go.dev) 1.22+
 
 ## Getting Started
 
 ```bash
-# Install dependencies
-bun install
+# Fetch dependencies
+go mod tidy
 
-# Start the server (development mode with file watching)
-bun run dev
+# Run
+go run .
 
-# Or start without watch mode
-bun run start
+# Or build a binary
+go build -o mock-msp . && ./mock-msp
 ```
 
 ### CLI Options
@@ -40,7 +40,7 @@ bun run start
 Example:
 
 ```bash
-bun run dev --port 8080 --url https://my-msp.example.com
+go run . --port 8080 --url https://my-msp.example.com
 ```
 
 ## Using with ngrok
@@ -54,7 +54,7 @@ ngrok http 3010
 # 2. Copy the forwarding URL from ngrok (e.g. https://ab12-34-56-78.ngrok-free.app)
 
 # 3. Start the server with the ngrok URL so OCPI endpoints advertise the correct public address
-bun run dev --url https://ab12-34-56-78.ngrok-free.app
+go run . --url https://ab12-34-56-78.ngrok-free.app
 ```
 
 The `--url` flag ensures that the versions and credentials endpoints return the ngrok URL instead of `localhost`, so the CPO can reach your server over the internet.
@@ -88,10 +88,10 @@ Two pre-configured RFID tokens (`valid-token-1`, `valid-token-2`) are available 
 ## Project Structure
 
 ```
-src/
-  index.tsx    # Entry point — CLI arg parsing, TUI setup
-  server.ts    # Express server with OCPI endpoint handlers
-  App.tsx      # React-based TUI dashboard component
+main.go      # Entry point — CLI flag parsing, server + TUI wiring
+server.go    # net/http server with OCPI endpoint handlers
+pull.go      # CPO endpoint discovery and pull-module logic
+tui.go       # Bubble Tea TUI dashboard
 ```
 
 ## License

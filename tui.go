@@ -1,0 +1,670 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+const maxLogs = 200
+
+type view int
+
+const (
+	viewDashboard view = iota
+	viewList
+	viewDetail
+)
+
+type moduleDef struct {
+	id      string
+	label   string
+	pullKey string
+}
+
+var modules = []moduleDef{
+	{"locations", "Locations", "1"},
+	{"sessions", "Sessions", "2"},
+	{"cdrs", "CDRs", "3"},
+	{"tariffs", "Tariffs", "4"},
+	{"tokens", "Tokens", "5"},
+}
+
+// --- Colors (Tokyo Night) ---
+var (
+	cBlue    = lipgloss.Color("#7aa2f7")
+	cGreen   = lipgloss.Color("#9ece6a")
+	cCyan    = lipgloss.Color("#7dcfff")
+	cPurple  = lipgloss.Color("#bb9af7")
+	cRed     = lipgloss.Color("#f7768e")
+	cOrange  = lipgloss.Color("#e0af68")
+	cOrange2 = lipgloss.Color("#ff9e64")
+	cText    = lipgloss.Color("#c0caf5")
+	cMuted   = lipgloss.Color("#565f89")
+)
+
+// --- Messages ---
+type logMsg LogEntry
+type stateChangeMsg struct{}
+type pullResultMsg string
+
+func waitForLog(ch <-chan LogEntry) tea.Cmd {
+	return func() tea.Msg { return logMsg(<-ch) }
+}
+func waitForStateChange(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg { <-ch; return stateChangeMsg{} }
+}
+
+// --- Model ---
+type model struct {
+	srv         *Server
+	url         string
+	port        int
+	logCh       <-chan LogEntry
+	stateCh     <-chan struct{}
+	logs        []LogEntry
+	view        view
+	activeMod   string
+	activeKey   string
+	selectedIdx int
+	detailScroll int
+	width       int
+	height      int
+}
+
+func newModel(srv *Server, url string, port int, logCh <-chan LogEntry, stateCh <-chan struct{}) model {
+	return model{
+		srv:     srv,
+		url:     url,
+		port:    port,
+		logCh:   logCh,
+		stateCh: stateCh,
+		logs:    make([]LogEntry, 0, maxLogs),
+		view:    viewDashboard,
+		width:   120,
+		height:  40,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(waitForLog(m.logCh), waitForStateChange(m.stateCh))
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
+	case logMsg:
+		m.logs = append(m.logs, LogEntry(msg))
+		if len(m.logs) > maxLogs {
+			m.logs = m.logs[len(m.logs)-maxLogs:]
+		}
+		return m, waitForLog(m.logCh)
+
+	case stateChangeMsg:
+		return m, waitForStateChange(m.stateCh)
+
+	case pullResultMsg:
+		return m, nil
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+	}
+	return m, nil
+}
+
+func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := k.String()
+
+	if key == "ctrl+c" {
+		return m, tea.Quit
+	}
+	if key == "q" {
+		if m.view == viewDashboard {
+			return m, tea.Quit
+		}
+		m.view = viewDashboard
+		m.selectedIdx = 0
+		return m, nil
+	}
+	if key == "esc" {
+		switch m.view {
+		case viewDetail:
+			m.view = viewList
+			m.selectedIdx = 0
+		case viewList:
+			m.view = viewDashboard
+			m.selectedIdx = 0
+		}
+		return m, nil
+	}
+
+	switch m.view {
+	case viewDashboard:
+		for _, mod := range modules {
+			if key == mod.pullKey {
+				return m, pullCmd(m.srv, mod.id)
+			}
+		}
+		switch key {
+		case "j", "down":
+			if m.selectedIdx < len(modules)-1 {
+				m.selectedIdx++
+			}
+		case "k", "up":
+			if m.selectedIdx > 0 {
+				m.selectedIdx--
+			}
+		case "enter":
+			mod := modules[m.selectedIdx]
+			m.view = viewList
+			m.activeMod = mod.id
+			m.selectedIdx = 0
+		case "c":
+			m.logs = m.logs[:0]
+		case "a":
+			return m, pullAllCmd(m.srv)
+		}
+
+	case viewList:
+		entries := m.listEntries()
+		switch key {
+		case "j", "down":
+			if m.selectedIdx < len(entries)-1 {
+				m.selectedIdx++
+			}
+		case "k", "up":
+			if m.selectedIdx > 0 {
+				m.selectedIdx--
+			}
+		case "enter":
+			if m.selectedIdx < len(entries) {
+				m.view = viewDetail
+				m.activeKey = entries[m.selectedIdx].key
+				m.detailScroll = 0
+			}
+		case "p":
+			return m, pullCmd(m.srv, m.activeMod)
+		}
+
+	case viewDetail:
+		switch key {
+		case "j", "down":
+			m.detailScroll++
+		case "k", "up":
+			m.detailScroll--
+		case "pgdown", " ":
+			m.detailScroll += m.detailPageSize()
+		case "pgup", "b":
+			m.detailScroll -= m.detailPageSize()
+		case "g", "home":
+			m.detailScroll = 0
+		case "G", "end":
+			m.detailScroll = m.detailMaxScroll()
+		}
+		if max := m.detailMaxScroll(); m.detailScroll > max {
+			m.detailScroll = max
+		}
+		if m.detailScroll < 0 {
+			m.detailScroll = 0
+		}
+	}
+	return m, nil
+}
+
+func pullCmd(srv *Server, module string) tea.Cmd {
+	return func() tea.Msg {
+		return pullResultMsg(srv.PullModule(module))
+	}
+}
+
+func pullAllCmd(srv *Server) tea.Cmd {
+	return func() tea.Msg {
+		results := make([]string, 0, len(modules))
+		for _, mod := range modules {
+			results = append(results, srv.PullModule(mod.id))
+		}
+		return pullResultMsg(strings.Join(results, " | "))
+	}
+}
+
+type storeEntry struct {
+	key string
+	obj map[string]any
+}
+
+func (m model) listEntries() []storeEntry {
+	m.srv.State.mu.RLock()
+	defer m.srv.State.mu.RUnlock()
+	store := m.srv.State.Store(m.activeMod)
+	out := make([]storeEntry, 0, len(store))
+	for k, v := range store {
+		out = append(out, storeEntry{k, v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	return out
+}
+
+// --- View ---
+func (m model) View() string {
+	header := m.renderHeader()
+	body := m.renderBody()
+	return lipgloss.JoinVertical(lipgloss.Left, header, body)
+}
+
+func (m model) renderHeader() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(cText).Render("Mock MSP OCPI 2.1.1")
+	crumb := ""
+	switch m.view {
+	case viewList:
+		crumb = lipgloss.NewStyle().Foreground(cMuted).Render(" > " + m.activeMod)
+	case viewDetail:
+		crumb = lipgloss.NewStyle().Foreground(cMuted).Render(fmt.Sprintf(" > %s > %s", m.activeMod, m.activeKey))
+	}
+	right := lipgloss.NewStyle().Foreground(cMuted).Render(fmt.Sprintf("%s | :%d", m.url, m.port))
+
+	inner := m.width - 4
+	if inner < 20 {
+		inner = 20
+	}
+	left := title + crumb
+	gap := inner - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	line := left + strings.Repeat(" ", gap) + right
+	return lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(cBlue).
+		Padding(0, 1).
+		Width(m.width - 2).
+		Render(line)
+}
+
+func (m model) renderBody() string {
+	leftW := 40
+	rightW := m.width - leftW - 2
+	if rightW < 20 {
+		rightW = 20
+	}
+	bodyH := m.height - 5
+	if bodyH < 10 {
+		bodyH = 10
+	}
+
+	left := m.renderLeftPanel(leftW, bodyH)
+	right := m.renderRightPanel(rightW, bodyH)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+}
+
+func (m model) renderLeftPanel(w, h int) string {
+	status := m.renderStatusBox(w)
+	var middle string
+	if m.view == viewDashboard {
+		middle = m.renderBrowseBox(w) + "\n" + m.renderPullBox(w)
+	} else {
+		middle = m.renderNavBox(w)
+	}
+	return lipgloss.NewStyle().Width(w).Render(
+		lipgloss.JoinVertical(lipgloss.Left, status, middle),
+	)
+}
+
+func (m model) renderStatusBox(w int) string {
+	m.srv.State.mu.RLock()
+	registered := m.srv.State.CPOCredentials != nil
+	var cpoName string
+	if registered {
+		if bd, ok := m.srv.State.CPOCredentials["business_details"].(map[string]any); ok {
+			cpoName, _ = bd["name"].(string)
+		}
+	}
+	counts := m.srv.State.Counts
+	m.srv.State.mu.RUnlock()
+
+	regValue := "No"
+	regColor := cRed
+	if registered {
+		regValue = cpoName
+		if regValue == "" {
+			regValue = "Yes"
+		}
+		regColor = cGreen
+	}
+
+	lines := []string{
+		kvRow("CPO Registered:", regValue, regColor, w-4),
+	}
+	for _, mod := range modules {
+		n := 0
+		switch mod.id {
+		case "locations":
+			n = counts.Locations
+		case "sessions":
+			n = counts.Sessions
+		case "cdrs":
+			n = counts.CDRs
+		case "tariffs":
+			n = counts.Tariffs
+		case "tokens":
+			n = counts.Tokens
+		}
+		lines = append(lines, kvRow(mod.label+":", fmt.Sprintf("%d", n), cText, w-4))
+	}
+	return boxed("Status", strings.Join(lines, "\n"), cGreen, w)
+}
+
+func kvRow(label, value string, valColor lipgloss.Color, w int) string {
+	l := lipgloss.NewStyle().Foreground(cMuted).Render(label)
+	v := lipgloss.NewStyle().Foreground(valColor).Render(value)
+	gap := w - lipgloss.Width(l) - lipgloss.Width(v)
+	if gap < 1 {
+		gap = 1
+	}
+	return l + strings.Repeat(" ", gap) + v
+}
+
+func (m model) renderBrowseBox(w int) string {
+	var b strings.Builder
+	m.srv.State.mu.RLock()
+	counts := m.srv.State.Counts
+	m.srv.State.mu.RUnlock()
+	for i, mod := range modules {
+		n := 0
+		switch mod.id {
+		case "locations":
+			n = counts.Locations
+		case "sessions":
+			n = counts.Sessions
+		case "cdrs":
+			n = counts.CDRs
+		case "tariffs":
+			n = counts.Tariffs
+		case "tokens":
+			n = counts.Tokens
+		}
+		prefix := "  "
+		style := lipgloss.NewStyle().Foreground(cText)
+		if i == m.selectedIdx {
+			prefix = "> "
+			style = lipgloss.NewStyle().Foreground(cCyan)
+		}
+		b.WriteString(style.Render(fmt.Sprintf("%s%s (%d)", prefix, mod.label, n)))
+		b.WriteString("\n")
+	}
+	b.WriteString(lipgloss.NewStyle().Foreground(cMuted).Render("\nj/k navigate, Enter to open"))
+	return boxed("Browse", b.String(), cCyan, w)
+}
+
+func (m model) renderPullBox(w int) string {
+	keyStyle := lipgloss.NewStyle().Foreground(cPurple)
+	var b strings.Builder
+	for _, mod := range modules {
+		b.WriteString(keyStyle.Render("["+mod.pullKey+"]") + " " + mod.label + "\n")
+	}
+	b.WriteString(keyStyle.Render("[a]") + " Pull All\n")
+	b.WriteString(keyStyle.Render("[c]") + " Clear Logs\n")
+	b.WriteString(keyStyle.Render("[q]") + " Quit")
+	return boxed("Pull", b.String(), cPurple, w)
+}
+
+func (m model) renderNavBox(w int) string {
+	keyStyle := lipgloss.NewStyle().Foreground(cPurple)
+	var b strings.Builder
+	b.WriteString(keyStyle.Render("[j/k]") + " Scroll\n")
+	if m.view == viewList {
+		b.WriteString(keyStyle.Render("[Enter]") + " View detail\n")
+		b.WriteString(keyStyle.Render("[p]") + " Pull " + m.activeMod + "\n")
+	}
+	if m.view == viewDetail {
+		b.WriteString(keyStyle.Render("[pgup/pgdn]") + " Page\n")
+		b.WriteString(keyStyle.Render("[g/G]") + " Top/Bottom\n")
+	}
+	b.WriteString(keyStyle.Render("[Esc]") + " Back\n")
+	b.WriteString(keyStyle.Render("[q]") + " Dashboard")
+	return boxed("Navigation", b.String(), cPurple, w)
+}
+
+func (m model) renderRightPanel(w, h int) string {
+	var title, content string
+	contentH := h - 3 // border (2) + title (1)
+	if contentH < 1 {
+		contentH = 1
+	}
+	contentW := w - 4
+	switch m.view {
+	case viewDashboard:
+		title = "Request Log"
+		content = m.renderRequestLog(contentW, contentH)
+	case viewList:
+		label := m.activeMod
+		for _, mod := range modules {
+			if mod.id == m.activeMod {
+				label = mod.label
+			}
+		}
+		title = label
+		content = m.renderObjectList(contentW, contentH)
+	case viewDetail:
+		title = m.activeKey
+		content = m.renderObjectDetail(contentW, contentH)
+	}
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cMuted).
+		Width(w).
+		Height(h)
+	titleStyle := lipgloss.NewStyle().Foreground(cText).Render(" " + title + " ")
+	body := lipgloss.JoinVertical(lipgloss.Left, titleStyle, content)
+	return style.Render(body)
+}
+
+var methodColors = map[string]lipgloss.Color{
+	"GET":    cGreen,
+	"POST":   cBlue,
+	"PUT":    cOrange,
+	"PATCH":  cPurple,
+	"DELETE": cRed,
+	"OUT":    cCyan,
+}
+
+func (m model) renderRequestLog(w, h int) string {
+	if len(m.logs) == 0 {
+		return lipgloss.NewStyle().Foreground(cMuted).Render("Waiting for requests...")
+	}
+	start := 0
+	if len(m.logs) > h {
+		start = len(m.logs) - h
+	}
+	visible := m.logs[start:]
+	// reverse so newest on top
+	rev := make([]LogEntry, len(visible))
+	for i, e := range visible {
+		rev[len(visible)-1-i] = e
+	}
+	var b strings.Builder
+	tsStyle := lipgloss.NewStyle().Foreground(cMuted)
+	urlStyle := lipgloss.NewStyle().Foreground(cText)
+	for _, l := range rev {
+		ts := l.Timestamp
+		if len(ts) >= 19 {
+			ts = ts[11:19]
+		}
+		color, ok := methodColors[l.Method]
+		if !ok {
+			color = cText
+		}
+		method := lipgloss.NewStyle().Foreground(color).Width(6).Render(l.Method)
+		line := fmt.Sprintf("%s %s %s", tsStyle.Render(ts), method, urlStyle.Render(l.URL))
+		if lipgloss.Width(line) > w {
+			line = truncAnsi(line, w)
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func truncAnsi(s string, w int) string {
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	// rough truncation — lipgloss doesn't expose ansi-aware truncation directly
+	return s[:w]
+}
+
+func (m model) renderObjectList(w, h int) string {
+	entries := m.listEntries()
+	if len(entries) == 0 {
+		return lipgloss.NewStyle().Foreground(cMuted).Render("No objects. Press [p] to pull or [Esc] to go back.")
+	}
+	start := 0
+	if m.selectedIdx >= h {
+		start = m.selectedIdx - h + 1
+	}
+	end := start + h
+	if end > len(entries) {
+		end = len(entries)
+	}
+	var b strings.Builder
+	for i := start; i < end; i++ {
+		e := entries[i]
+		label := e.key
+		for _, k := range []string{"name", "uid", "id"} {
+			if v, ok := e.obj[k].(string); ok && v != "" {
+				label = v
+				break
+			}
+		}
+		selected := i == m.selectedIdx
+		prefix := " "
+		lblColor := cText
+		keyColor := cMuted
+		if selected {
+			prefix = ">"
+			lblColor = cCyan
+			keyColor = cCyan
+		}
+		aux := ""
+		if label != e.key {
+			aux = lipgloss.NewStyle().Foreground(cMuted).Render(" (" + e.key + ")")
+		}
+		row := lipgloss.NewStyle().Foreground(keyColor).Render(prefix) +
+			" " + lipgloss.NewStyle().Foreground(lblColor).Render(label) + aux
+		b.WriteString(row)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+var jsonKeyRe = regexp.MustCompile(`^(\s*)"([^"]+)"(:)\s*(.*)$`)
+
+func (m model) renderObjectDetail(w, h int) string {
+	m.srv.State.mu.RLock()
+	obj, ok := m.srv.State.Store(m.activeMod)[m.activeKey]
+	m.srv.State.mu.RUnlock()
+	if !ok {
+		return lipgloss.NewStyle().Foreground(cRed).Render("Object not found")
+	}
+	raw, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return lipgloss.NewStyle().Foreground(cRed).Render(err.Error())
+	}
+	lines := strings.Split(string(raw), "\n")
+	total := len(lines)
+	start := m.detailScroll
+	if start > total-1 {
+		start = total - 1
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + h - 1 // reserve 1 line for footer
+	if end > total {
+		end = total
+	}
+	keyStyle := lipgloss.NewStyle().Foreground(cBlue)
+	textStyle := lipgloss.NewStyle().Foreground(cText)
+	var b strings.Builder
+	for _, line := range lines[start:end] {
+		match := jsonKeyRe.FindStringSubmatch(line)
+		if match != nil {
+			indent, jsonKey, colon, rest := match[1], match[2], match[3], match[4]
+			valColor := valueColor(rest)
+			b.WriteString(indent + keyStyle.Render("\""+jsonKey+"\"") + colon + " " +
+				lipgloss.NewStyle().Foreground(valColor).Render(rest))
+		} else {
+			b.WriteString(textStyle.Render(line))
+		}
+		b.WriteString("\n")
+	}
+	footer := fmt.Sprintf("%d-%d/%d  [j/k ↑↓ pgup/pgdn g/G]", start+1, end, total)
+	b.WriteString(lipgloss.NewStyle().Foreground(cMuted).Render(footer))
+	return b.String()
+}
+
+func (m model) detailLineCount() int {
+	m.srv.State.mu.RLock()
+	obj, ok := m.srv.State.Store(m.activeMod)[m.activeKey]
+	m.srv.State.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	raw, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(raw), "\n") + 1
+}
+
+func (m model) detailPageSize() int {
+	// matches renderObjectDetail's visible JSON-line count:
+	// header box (3) + right-panel border (2) + title (1) + footer (1) + header-bottom-gap (2) = 9
+	h := m.height - 9
+	if h < 3 {
+		return 3
+	}
+	return h
+}
+
+func (m model) detailMaxScroll() int {
+	n := m.detailLineCount() - m.detailPageSize()
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func valueColor(raw string) lipgloss.Color {
+	t := strings.TrimSuffix(strings.TrimSpace(raw), ",")
+	if t == "true" || t == "false" {
+		return cOrange2
+	}
+	if t == "null" {
+		return cMuted
+	}
+	if len(t) > 0 && (t[0] == '-' || (t[0] >= '0' && t[0] <= '9')) {
+		return cOrange2
+	}
+	if strings.HasPrefix(t, "\"") && strings.HasSuffix(t, "\"") {
+		return cGreen
+	}
+	return cText
+}
+
+func boxed(title, content string, color lipgloss.Color, width int) string {
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(color).
+		Padding(0, 1).
+		Width(width - 2)
+	titled := lipgloss.NewStyle().Foreground(color).Render(" " + title + " ")
+	return box.Render(lipgloss.JoinVertical(lipgloss.Left, titled, content))
+}
