@@ -22,6 +22,13 @@ const (
 	viewDetail
 )
 
+type detailMode int
+
+const (
+	detailList detailMode = iota
+	detailJSON
+)
+
 type moduleDef struct {
 	id    string
 	label string
@@ -103,6 +110,9 @@ type model struct {
 	activeKey    string
 	selectedIdx  int
 	detailScroll int
+	detailPath   []string
+	detailMode   detailMode
+	subIdx       int
 	width        int
 	height       int
 }
@@ -184,8 +194,16 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key == "esc" {
 		switch m.view {
 		case viewDetail:
+			if len(m.detailPath) > 0 {
+				m.detailPath = m.detailPath[:len(m.detailPath)-1]
+				m.subIdx = 0
+				m.detailScroll = 0
+				m.detailMode = detailJSON
+				return m, nil
+			}
 			m.view = viewList
 			m.selectedIdx = 0
+			m.detailMode = detailJSON
 		case viewList:
 			m.view = viewDashboard
 			m.selectedIdx = 0
@@ -240,25 +258,67 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.view = viewDetail
 				m.activeKey = entries[m.selectedIdx].key
 				m.detailScroll = 0
+				m.detailPath = nil
+				m.subIdx = 0
+				m.detailMode = detailJSON
 			}
 		case "p":
 			return m, pullCmd(m.srv, m.activeMod)
 		}
 
 	case viewDetail:
+		obj, _ := m.resolveDetail()
+		children := m.detailChildren(obj)
+		inList := m.detailMode == detailList && len(children) > 0
 		switch key {
+		case "v":
+			if len(children) > 0 {
+				if m.detailMode == detailList {
+					m.detailMode = detailJSON
+				} else {
+					m.detailMode = detailList
+				}
+				m.detailScroll = 0
+			}
+		case "enter":
+			if inList && m.subIdx < len(children) {
+				m.detailPath = append(m.detailPath, children[m.subIdx].id)
+				m.subIdx = 0
+				m.detailScroll = 0
+				m.detailMode = detailJSON
+			}
 		case "j", "down":
-			m.detailScroll++
+			if inList {
+				if m.subIdx < len(children)-1 {
+					m.subIdx++
+				}
+			} else {
+				m.detailScroll++
+			}
 		case "k", "up":
-			m.detailScroll--
+			if inList {
+				if m.subIdx > 0 {
+					m.subIdx--
+				}
+			} else {
+				m.detailScroll--
+			}
 		case "pgdown", " ":
-			m.detailScroll += m.detailPageSize()
+			if !inList {
+				m.detailScroll += m.detailPageSize()
+			}
 		case "pgup", "b":
-			m.detailScroll -= m.detailPageSize()
+			if !inList {
+				m.detailScroll -= m.detailPageSize()
+			}
 		case "g", "home":
-			m.detailScroll = 0
+			if !inList {
+				m.detailScroll = 0
+			}
 		case "G", "end":
-			m.detailScroll = m.detailMaxScroll()
+			if !inList {
+				m.detailScroll = m.detailMaxScroll()
+			}
 		}
 		if max := m.detailMaxScroll(); m.detailScroll > max {
 			m.detailScroll = max
@@ -304,6 +364,94 @@ func (m model) listEntries() []storeEntry {
 	return out
 }
 
+type subEntry struct {
+	id    string
+	label string
+	aux   string
+}
+
+// resolveDetail walks detailPath from the root module object to the current
+// sub-object. Returns ok=false if any step can't be resolved (stale path).
+func (m model) resolveDetail() (map[string]any, bool) {
+	m.srv.State.mu.RLock()
+	obj, ok := m.srv.State.Store(m.activeMod)[m.activeKey]
+	m.srv.State.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	for i, step := range m.detailPath {
+		switch m.activeMod {
+		case "locations":
+			switch i {
+			case 0:
+				e, ok := findChild(asMapSlice(obj["evses"]), "uid", step)
+				if !ok {
+					return nil, false
+				}
+				obj = e
+			case 1:
+				c, ok := findChild(asMapSlice(obj["connectors"]), "id", step)
+				if !ok {
+					return nil, false
+				}
+				obj = c
+			default:
+				return nil, false
+			}
+		case "sessions":
+			if i == 0 && step == "charging_preferences" {
+				cp, ok := obj["charging_preferences"].(map[string]any)
+				if !ok {
+					return nil, false
+				}
+				obj = cp
+			} else {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+	}
+	return obj, true
+}
+
+// detailChildren returns drillable sub-objects of the current detail obj.
+func (m model) detailChildren(obj map[string]any) []subEntry {
+	if obj == nil {
+		return nil
+	}
+	switch m.activeMod {
+	case "locations":
+		switch len(m.detailPath) {
+		case 0:
+			evses := asMapSlice(obj["evses"])
+			out := make([]subEntry, 0, len(evses))
+			for _, e := range evses {
+				uid, _ := e["uid"].(string)
+				status, _ := e["status"].(string)
+				out = append(out, subEntry{id: uid, label: uid, aux: status})
+			}
+			return out
+		case 1:
+			conns := asMapSlice(obj["connectors"])
+			out := make([]subEntry, 0, len(conns))
+			for _, c := range conns {
+				id, _ := c["id"].(string)
+				std, _ := c["standard"].(string)
+				out = append(out, subEntry{id: id, label: "Connector " + id, aux: std})
+			}
+			return out
+		}
+	case "sessions":
+		if len(m.detailPath) == 0 {
+			if _, ok := obj["charging_preferences"].(map[string]any); ok {
+				return []subEntry{{id: "charging_preferences", label: "charging_preferences", aux: "preferences"}}
+			}
+		}
+	}
+	return nil
+}
+
 // --- View ---
 func (m model) View() string {
 	header := m.renderHeader()
@@ -322,7 +470,9 @@ func (m model) renderHeader() string {
 	case viewList:
 		crumb = lipgloss.NewStyle().Foreground(cMuted).Render(" > " + m.activeMod)
 	case viewDetail:
-		crumb = lipgloss.NewStyle().Foreground(cMuted).Render(fmt.Sprintf(" > %s > %s", m.activeMod, m.activeKey))
+		parts := []string{m.activeMod, m.activeKey}
+		parts = append(parts, m.detailPath...)
+		crumb = lipgloss.NewStyle().Foreground(cMuted).Render(" > " + strings.Join(parts, " > "))
 	}
 	right := lipgloss.NewStyle().Foreground(cMuted).Render(fmt.Sprintf("%s | :%d", m.url, m.port))
 
@@ -515,8 +665,18 @@ func (m model) renderNavBox(w int) string {
 		b.WriteString(keyStyle.Render("[p]") + " Pull " + m.activeMod + "\n")
 	}
 	if m.view == viewDetail {
-		b.WriteString(keyStyle.Render("[pgup/pgdn]") + " Page\n")
-		b.WriteString(keyStyle.Render("[g/G]") + " Top/Bottom\n")
+		obj, _ := m.resolveDetail()
+		hasChildren := len(m.detailChildren(obj)) > 0
+		if hasChildren && m.detailMode == detailList {
+			b.WriteString(keyStyle.Render("[Enter]") + " Drill into sub-object\n")
+			b.WriteString(keyStyle.Render("[v]") + " View raw JSON\n")
+		} else {
+			b.WriteString(keyStyle.Render("[pgup/pgdn]") + " Page\n")
+			b.WriteString(keyStyle.Render("[g/G]") + " Top/Bottom\n")
+			if hasChildren {
+				b.WriteString(keyStyle.Render("[v]") + " View sub-objects\n")
+			}
+		}
 	}
 	b.WriteString(keyStyle.Render("[Esc]") + " Back\n")
 	b.WriteString(keyStyle.Render("[q]") + " Dashboard")
@@ -545,6 +705,9 @@ func (m model) renderRightPanel(w, h int) string {
 		content = m.renderObjectList(contentW, contentH)
 	case viewDetail:
 		title = m.activeKey
+		if len(m.detailPath) > 0 {
+			title = m.detailPath[len(m.detailPath)-1]
+		}
 		content = m.renderObjectDetail(contentW, contentH)
 	}
 	style := lipgloss.NewStyle().
@@ -660,17 +823,19 @@ func (m model) renderObjectList(w, h int) string {
 var jsonKeyRe = regexp.MustCompile(`^(\s*)"([^"]+)"(:)\s*(.*)$`)
 
 func (m model) renderObjectDetail(w, h int) string {
-	m.srv.State.mu.RLock()
-	obj, ok := m.srv.State.Store(m.activeMod)[m.activeKey]
-	m.srv.State.mu.RUnlock()
+	obj, ok := m.resolveDetail()
 	if !ok {
 		return lipgloss.NewStyle().Foreground(cRed).Render("Object not found")
+	}
+	ownershipHeader := ownershipDetailHeader(m.srv.Role, m.activeMod)
+	children := m.detailChildren(obj)
+	if m.detailMode == detailList && len(children) > 0 {
+		return m.renderChildList(ownershipHeader, children, w, h)
 	}
 	raw, err := json.MarshalIndent(obj, "", "  ")
 	if err != nil {
 		return lipgloss.NewStyle().Foreground(cRed).Render(err.Error())
 	}
-	ownershipHeader := ownershipDetailHeader(m.srv.Role, m.activeMod)
 	lines := strings.Split(string(raw), "\n")
 	total := len(lines)
 	start := m.detailScroll
@@ -707,9 +872,7 @@ func (m model) renderObjectDetail(w, h int) string {
 }
 
 func (m model) detailLineCount() int {
-	m.srv.State.mu.RLock()
-	obj, ok := m.srv.State.Store(m.activeMod)[m.activeKey]
-	m.srv.State.mu.RUnlock()
+	obj, ok := m.resolveDetail()
 	if !ok {
 		return 0
 	}
@@ -718,6 +881,45 @@ func (m model) detailLineCount() int {
 		return 0
 	}
 	return strings.Count(string(raw), "\n") + 1
+}
+
+func (m model) renderChildList(header string, children []subEntry, w, h int) string {
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n")
+	hint := "Enter to drill, v to view raw JSON, Esc to go back"
+	b.WriteString(lipgloss.NewStyle().Foreground(cMuted).Render(hint))
+	b.WriteString("\n\n")
+	start := 0
+	maxRows := h - 4
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	if m.subIdx >= maxRows {
+		start = m.subIdx - maxRows + 1
+	}
+	end := start + maxRows
+	if end > len(children) {
+		end = len(children)
+	}
+	for i := start; i < end; i++ {
+		c := children[i]
+		prefix := " "
+		lbl := lipgloss.NewStyle().Foreground(cText)
+		aux := lipgloss.NewStyle().Foreground(cMuted)
+		if i == m.subIdx {
+			prefix = ">"
+			lbl = lipgloss.NewStyle().Foreground(cCyan)
+			aux = lipgloss.NewStyle().Foreground(cCyan)
+		}
+		row := lbl.Render(prefix+" "+c.label)
+		if c.aux != "" {
+			row += " " + aux.Render("("+c.aux+")")
+		}
+		b.WriteString(row)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (m model) detailPageSize() int {
