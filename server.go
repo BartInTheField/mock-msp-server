@@ -444,6 +444,56 @@ func (s *Server) registerVersionRoutes(mux *http.ServeMux, v string) {
 	}
 }
 
+// asMapSlice normalizes a JSON array value (which may decode as []any or be
+// constructed as []map[string]any) to []map[string]any for in-place editing.
+func asMapSlice(v any) []map[string]any {
+	switch arr := v.(type) {
+	case []map[string]any:
+		return arr
+	case []any:
+		out := make([]map[string]any, 0, len(arr))
+		for _, it := range arr {
+			if m, ok := it.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// upsertChild finds an entry in a map-slice where `keyField` equals `id`. If
+// found and merge is true, merges body into it; otherwise replaces it. If not
+// found, appends body (with keyField set to id).
+func upsertChild(children []map[string]any, keyField, id string, body map[string]any, merge bool) []map[string]any {
+	for i, c := range children {
+		if v, _ := c[keyField].(string); v == id {
+			if merge {
+				for k, val := range body {
+					c[k] = val
+				}
+				children[i] = c
+			} else {
+				body[keyField] = id
+				children[i] = body
+			}
+			return children
+		}
+	}
+	body[keyField] = id
+	return append(children, body)
+}
+
+// findChild returns the entry in a map-slice whose keyField equals id.
+func findChild(children []map[string]any, keyField, id string) (map[string]any, bool) {
+	for _, c := range children {
+		if v, _ := c[keyField].(string); v == id {
+			return c, true
+		}
+	}
+	return nil, false
+}
+
 // putOrPatchModule returns a handler that stores/updates an item keyed by
 // {countryCode}/{partyId}/{idParam}. Used for locations, sessions, tariffs, tokens.
 func (s *Server) putOrPatchModule(module, idParam string, merge bool) http.HandlerFunc {
@@ -480,6 +530,80 @@ func (s *Server) putOrPatchModule(module, idParam string, merge bool) http.Handl
 			}
 		}
 		store[key] = merged
+		s.State.mu.Unlock()
+		s.OnStateChange()
+		writeJSON(w, 200, okResponse(nil))
+	}
+}
+
+// putOrPatchEVSE upserts an EVSE into a location's `evses` array.
+func (s *Server) putOrPatchEVSE(merge bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cc := r.PathValue("countryCode")
+		pid := r.PathValue("partyId")
+		id := r.PathValue("id")
+		evseUID := r.PathValue("evseUid")
+		key := fmt.Sprintf("%s/%s/%s", cc, pid, id)
+
+		var body map[string]any
+		if err := decodeBody(r, &body); err != nil {
+			body = map[string]any{}
+		}
+
+		s.State.mu.Lock()
+		loc, ok := s.State.Locations[key]
+		if !ok {
+			s.State.mu.Unlock()
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "Location not found"))
+			return
+		}
+		evses := asMapSlice(loc["evses"])
+		evses = upsertChild(evses, "uid", evseUID, body, merge)
+		loc["evses"] = evses
+		loc["last_updated"] = nowISO()
+		s.State.Locations[key] = loc
+		s.State.mu.Unlock()
+		s.OnStateChange()
+		writeJSON(w, 200, okResponse(nil))
+	}
+}
+
+// putOrPatchConnector upserts a Connector into an EVSE's `connectors` array.
+func (s *Server) putOrPatchConnector(merge bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cc := r.PathValue("countryCode")
+		pid := r.PathValue("partyId")
+		id := r.PathValue("id")
+		evseUID := r.PathValue("evseUid")
+		connectorID := r.PathValue("connectorId")
+		key := fmt.Sprintf("%s/%s/%s", cc, pid, id)
+
+		var body map[string]any
+		if err := decodeBody(r, &body); err != nil {
+			body = map[string]any{}
+		}
+
+		s.State.mu.Lock()
+		loc, ok := s.State.Locations[key]
+		if !ok {
+			s.State.mu.Unlock()
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "Location not found"))
+			return
+		}
+		evses := asMapSlice(loc["evses"])
+		evse, ok := findChild(evses, "uid", evseUID)
+		if !ok {
+			s.State.mu.Unlock()
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "EVSE not found"))
+			return
+		}
+		connectors := asMapSlice(evse["connectors"])
+		connectors = upsertChild(connectors, "id", connectorID, body, merge)
+		evse["connectors"] = connectors
+		evse["last_updated"] = nowISO()
+		loc["evses"] = evses
+		loc["last_updated"] = nowISO()
+		s.State.Locations[key] = loc
 		s.State.mu.Unlock()
 		s.OnStateChange()
 		writeJSON(w, 200, okResponse(nil))
@@ -533,6 +657,14 @@ func (s *Server) registerMSPRoutes(mux *http.ServeMux, v string) {
 	// Locations / Sessions / Tariffs receivers
 	mux.HandleFunc("PUT "+receiver+"/locations/{countryCode}/{partyId}/{id}", s.putOrPatchModule("locations", "id", false))
 	mux.HandleFunc("PATCH "+receiver+"/locations/{countryCode}/{partyId}/{id}", s.putOrPatchModule("locations", "id", true))
+
+	// EVSE sub-object (both versions)
+	mux.HandleFunc("PUT "+receiver+"/locations/{countryCode}/{partyId}/{id}/{evseUid}", s.putOrPatchEVSE(false))
+	mux.HandleFunc("PATCH "+receiver+"/locations/{countryCode}/{partyId}/{id}/{evseUid}", s.putOrPatchEVSE(true))
+
+	// Connector sub-object (both versions)
+	mux.HandleFunc("PUT "+receiver+"/locations/{countryCode}/{partyId}/{id}/{evseUid}/{connectorId}", s.putOrPatchConnector(false))
+	mux.HandleFunc("PATCH "+receiver+"/locations/{countryCode}/{partyId}/{id}/{evseUid}/{connectorId}", s.putOrPatchConnector(true))
 
 	mux.HandleFunc("PUT "+receiver+"/sessions/{countryCode}/{partyId}/{id}", s.putOrPatchModule("sessions", "id", false))
 	mux.HandleFunc("PATCH "+receiver+"/sessions/{countryCode}/{partyId}/{id}", s.putOrPatchModule("sessions", "id", true))
@@ -632,9 +764,93 @@ func (s *Server) registerCPORoutes(mux *http.ServeMux, v string) {
 	mux.HandleFunc("GET "+sender+"/locations", listSender("locations"))
 	mux.HandleFunc("GET "+sender+"/locations/{countryCode}/{partyId}/{id}", getSenderByKey("locations"))
 
+	// EVSE sub-object GET
+	mux.HandleFunc("GET "+sender+"/locations/{countryCode}/{partyId}/{id}/{evseUid}", func(w http.ResponseWriter, r *http.Request) {
+		cc := r.PathValue("countryCode")
+		pid := r.PathValue("partyId")
+		id := r.PathValue("id")
+		evseUID := r.PathValue("evseUid")
+		key := fmt.Sprintf("%s/%s/%s", cc, pid, id)
+		s.State.mu.RLock()
+		loc, ok := s.State.Locations[key]
+		s.State.mu.RUnlock()
+		if !ok {
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "Location not found"))
+			return
+		}
+		evse, ok := findChild(asMapSlice(loc["evses"]), "uid", evseUID)
+		if !ok {
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "EVSE not found"))
+			return
+		}
+		writeJSON(w, 200, okResponse(evse))
+	})
+
+	// Connector sub-object GET
+	mux.HandleFunc("GET "+sender+"/locations/{countryCode}/{partyId}/{id}/{evseUid}/{connectorId}", func(w http.ResponseWriter, r *http.Request) {
+		cc := r.PathValue("countryCode")
+		pid := r.PathValue("partyId")
+		id := r.PathValue("id")
+		evseUID := r.PathValue("evseUid")
+		connectorID := r.PathValue("connectorId")
+		key := fmt.Sprintf("%s/%s/%s", cc, pid, id)
+		s.State.mu.RLock()
+		loc, ok := s.State.Locations[key]
+		s.State.mu.RUnlock()
+		if !ok {
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "Location not found"))
+			return
+		}
+		evse, ok := findChild(asMapSlice(loc["evses"]), "uid", evseUID)
+		if !ok {
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "EVSE not found"))
+			return
+		}
+		conn, ok := findChild(asMapSlice(evse["connectors"]), "id", connectorID)
+		if !ok {
+			writeJSON(w, 404, ocpiResponse(nil, 2004, "Connector not found"))
+			return
+		}
+		writeJSON(w, 200, okResponse(conn))
+	})
+
 	mux.HandleFunc("GET "+sender+"/sessions", listSender("sessions"))
 	mux.HandleFunc("GET "+sender+"/cdrs", listSender("cdrs"))
 	mux.HandleFunc("GET "+sender+"/tariffs", listSender("tariffs"))
+
+	// ChargingPreferences sub-object (2.2.1 only) — MSP pushes preferences for a session to CPO.
+	if v == VersionV221 {
+		mux.HandleFunc("PUT "+sender+"/sessions/{countryCode}/{partyId}/{sessionId}/charging_preferences", func(w http.ResponseWriter, r *http.Request) {
+			cc := r.PathValue("countryCode")
+			pid := r.PathValue("partyId")
+			sid := r.PathValue("sessionId")
+			key := fmt.Sprintf("%s/%s/%s", cc, pid, sid)
+
+			var prefs map[string]any
+			if err := decodeBody(r, &prefs); err != nil {
+				prefs = map[string]any{}
+			}
+
+			s.State.mu.Lock()
+			sess, ok := s.State.Sessions[key]
+			if !ok {
+				s.State.mu.Unlock()
+				writeJSON(w, 404, ocpiResponse(nil, 2004, "Session not found"))
+				return
+			}
+			sess["charging_preferences"] = prefs
+			sess["last_updated"] = nowISO()
+			s.State.Sessions[key] = sess
+			s.State.mu.Unlock()
+			s.OnStateChange()
+
+			profileType, _ := prefs["profile_type"].(string)
+			if profileType == "" {
+				profileType = "REGULAR"
+			}
+			writeJSON(w, 200, okResponse(map[string]any{"result": "ACCEPTED", "profile_type": profileType}))
+		})
+	}
 
 	// Receiver: tokens (MSP pushes these)
 	mux.HandleFunc("PUT "+receiver+"/tokens/{countryCode}/{partyId}/{tokenUid}", s.putOrPatchModule("tokens", "tokenUid", false))

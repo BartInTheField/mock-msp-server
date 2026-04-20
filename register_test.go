@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net"
@@ -10,6 +11,33 @@ import (
 	"testing"
 	"time"
 )
+
+func doJSON(t *testing.T, method, url string, body any) (int, map[string]any) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	m := map[string]any{}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		_ = json.Unmarshal(raw, &m)
+	}
+	return res.StatusCode, m
+}
 
 func startServer(t *testing.T, role string) *Server {
 	t.Helper()
@@ -220,5 +248,120 @@ func TestV221CredentialsShape(t *testing.T) {
 	bd211, _ := data211["business_details"].(map[string]any)
 	if name, _ := bd211["name"].(string); name != "Mock MSP" {
 		t.Errorf("2.1.1 business_details.name expected Mock MSP, got %q", name)
+	}
+}
+
+func TestLocationEVSESubObjectPutPatch(t *testing.T) {
+	msp := startServer(t, RoleMSP)
+
+	// First create the parent location.
+	locURL := msp.URL + "/ocpi/receiver/" + VersionV221 + "/locations/NL/CPO/LOC9"
+	status, _ := doJSON(t, "PUT", locURL, map[string]any{"name": "Test"})
+	if status != 200 {
+		t.Fatalf("PUT location: %d", status)
+	}
+
+	// PUT a new EVSE under it.
+	evseURL := locURL + "/EVSE99"
+	status, _ = doJSON(t, "PUT", evseURL, map[string]any{"status": "AVAILABLE"})
+	if status != 200 {
+		t.Fatalf("PUT evse: %d", status)
+	}
+	loc := msp.State.Locations["NL/CPO/LOC9"]
+	evses := asMapSlice(loc["evses"])
+	if len(evses) != 1 || evses[0]["uid"] != "EVSE99" || evses[0]["status"] != "AVAILABLE" {
+		t.Fatalf("EVSE not stored correctly: %v", evses)
+	}
+
+	// PATCH same EVSE — status flip, other fields preserved.
+	status, _ = doJSON(t, "PATCH", evseURL, map[string]any{"status": "CHARGING"})
+	if status != 200 {
+		t.Fatalf("PATCH evse: %d", status)
+	}
+	evses = asMapSlice(msp.State.Locations["NL/CPO/LOC9"]["evses"])
+	if evses[0]["status"] != "CHARGING" || evses[0]["uid"] != "EVSE99" {
+		t.Fatalf("PATCH did not merge: %v", evses[0])
+	}
+
+	// PUT a connector under that EVSE.
+	connURL := evseURL + "/1"
+	status, _ = doJSON(t, "PUT", connURL, map[string]any{"standard": "IEC_62196_T2"})
+	if status != 200 {
+		t.Fatalf("PUT connector: %d", status)
+	}
+	evse := asMapSlice(msp.State.Locations["NL/CPO/LOC9"]["evses"])[0]
+	conns := asMapSlice(evse["connectors"])
+	if len(conns) != 1 || conns[0]["id"] != "1" || conns[0]["standard"] != "IEC_62196_T2" {
+		t.Fatalf("connector not stored: %v", conns)
+	}
+
+	// Missing-parent cases return 404.
+	status, _ = doJSON(t, "PATCH", msp.URL+"/ocpi/receiver/"+VersionV221+"/locations/NL/CPO/UNKNOWN/EVSE1", map[string]any{})
+	if status != 404 {
+		t.Errorf("expected 404 for missing location, got %d", status)
+	}
+	status, _ = doJSON(t, "PATCH", locURL+"/NOPE/1", map[string]any{})
+	if status != 404 {
+		t.Errorf("expected 404 for missing EVSE, got %d", status)
+	}
+}
+
+func TestCPOSenderEVSEAndConnectorGET(t *testing.T) {
+	cpo := startServer(t, RoleCPO)
+	base := cpo.URL + "/ocpi/sender/" + VersionV221 + "/locations/NL/CPO/LOC001"
+
+	body := getJSON(t, base+"/EVSE001")
+	data, _ := body["data"].(map[string]any)
+	if data["uid"] != "EVSE001" {
+		t.Errorf("expected uid=EVSE001, got %v", data["uid"])
+	}
+
+	body = getJSON(t, base+"/EVSE001/1")
+	data, _ = body["data"].(map[string]any)
+	if data["id"] != "1" || data["standard"] != "IEC_62196_T2" {
+		t.Errorf("connector GET wrong: %v", data)
+	}
+}
+
+func TestChargingPreferencesV221Only(t *testing.T) {
+	cpo := startServer(t, RoleCPO)
+	msp := startServer(t, RoleMSP)
+
+	// Seed a session on the CPO so charging_preferences has a target.
+	cpo.State.mu.Lock()
+	cpo.State.Sessions["NL/MSP/SESS1"] = map[string]any{
+		"id":           "SESS1",
+		"country_code": "NL",
+		"party_id":     "MSP",
+	}
+	cpo.State.Counts.Sessions = 1
+	cpo.State.mu.Unlock()
+
+	prefsURL := cpo.URL + "/ocpi/sender/" + VersionV221 + "/sessions/NL/MSP/SESS1/charging_preferences"
+	prefs := map[string]any{"profile_type": "GREEN", "departure_time": "2026-04-20T20:00:00Z"}
+	status, body := doJSON(t, "PUT", prefsURL, prefs)
+	if status != 200 {
+		t.Fatalf("PUT charging_preferences: %d, body=%v", status, body)
+	}
+	data, _ := body["data"].(map[string]any)
+	if data["result"] != "ACCEPTED" || data["profile_type"] != "GREEN" {
+		t.Errorf("unexpected response: %v", data)
+	}
+	sess := cpo.State.Sessions["NL/MSP/SESS1"]
+	stored, ok := sess["charging_preferences"].(map[string]any)
+	if !ok || stored["profile_type"] != "GREEN" {
+		t.Errorf("charging_preferences not stored on session: %v", sess)
+	}
+
+	// 2.1.1 must NOT expose the endpoint (it doesn't exist in that version).
+	status, _ = doJSON(t, "PUT", cpo.URL+"/ocpi/sender/"+VersionV211+"/sessions/NL/MSP/SESS1/charging_preferences", prefs)
+	if status != 404 {
+		t.Errorf("expected 404 for charging_preferences on 2.1.1, got %d", status)
+	}
+
+	// Sanity: MSP side has no such endpoint either (CPO-only sub-object).
+	status, _ = doJSON(t, "PUT", msp.URL+"/ocpi/sender/"+VersionV221+"/sessions/NL/MSP/SESS1/charging_preferences", prefs)
+	if status != 404 {
+		t.Errorf("expected 404 on MSP, got %d", status)
 	}
 }
